@@ -2,7 +2,8 @@
 #
 # https://github.com/Nyr/openvpn-install
 # 
-# Modified for 'ovpn' command and UI improvements + Squid Proxy (No Auth / Multi-port)
+# Modified for 'ovpn' command, UI improvements, Secure Squid Proxy,
+# Dual Config Generation, Zip, and 0x0.st Upload.
 #
 
 # --- UI Colors ---
@@ -16,7 +17,7 @@ NC='\033[0m' # No Color
 function header() {
 	clear
 	echo -e "${GREEN}=================================================${NC}"
-	echo -e "${CYAN}          OPENVPN MANAGER v2.2 (No Auth)         ${NC}"
+	echo -e "${CYAN}      OPENVPN MANAGER v2.3 (Secure Proxy)        ${NC}"
 	echo -e "${GREEN}=================================================${NC}"
 	echo ""
 }
@@ -96,9 +97,9 @@ script_dir="$HOME"
 # --- Squid Logic ---
 function install_squid() {
 	header
-	echo -e "${CYAN}Installing Squid Proxy (No Authentication)...${NC}"
+	echo -e "${CYAN}Installing Squid Proxy (VPN Users Only)...${NC}"
 	
-	# Install packages (No need for apache2-utils/httpd-tools anymore as we removed auth)
+	# Install packages
 	if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
 		apt-get update
 		apt-get install -y squid
@@ -116,11 +117,16 @@ function install_squid() {
 	mv /etc/squid/squid.conf /etc/squid/squid.conf.bak 2>/dev/null
 
 	# Build the new config content
-	# Start with basic ACLs and headers
+	# SECURITY UPDATE: ACLs restricted to VPN subnet and localhost
 	cat <<EOF > /etc/squid/squid.conf
-# Allow all access (No Authentication)
-acl all src all
-http_access allow all
+# Define networks
+acl vpn_net src 10.8.0.0/24
+acl localhost src 127.0.0.1/32
+
+# Access Control
+http_access allow localhost
+http_access allow vpn_net
+http_access deny all
 
 # Ports
 EOF
@@ -140,7 +146,7 @@ refresh_pattern -i (/cgi-bin/|\?) 0	0%	0
 refresh_pattern .		0	20%	4320
 EOF
 
-	# Firewall - Open all specified ports
+	# Firewall - Open all specified ports (Necessary so they can connect to the IP, Squid ACL handles the reject)
 	if systemctl is-active --quiet firewalld.service; then
 		for port in $squid_ports_input; do
 			firewall-cmd --zone=public --add-port="$port"/tcp
@@ -158,7 +164,7 @@ EOF
 
 	echo
 	echo -e "${GREEN}Squid Proxy Installed on ports: $squid_ports_input${NC}"
-	echo -e "${YELLOW}configured without authentication.${NC}"
+	echo -e "${YELLOW}Configured to allow ONLY OpenVPN users (10.8.0.0/24).${NC}"
 	read -n1 -r -p "Press any key to continue..."
 }
 
@@ -593,58 +599,88 @@ else
 			cd /etc/openvpn/server/easy-rsa/
 			./easyrsa --batch --days=3650 build-client-full "$client" nopass
 			
-			# Build the .ovpn file
+			# 1. Build the STANDARD .ovpn file (No Proxy)
 			grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
 
-			# --- PROXY SUPPORT LOGIC (NO AUTH + HEADERS) ---
+			# --- PROXY SUPPORT LOGIC (AUTO-GENERATE SECOND FILE) ---
 			if hash squid 2>/dev/null; then
 				echo
 				echo -e "${CYAN}Squid Proxy is detected.${NC}"
-				read -p "Do you want this client to connect THROUGH the Squid Proxy? [y/N]: " use_proxy
-				if [[ "$use_proxy" =~ ^[yY]$ ]]; then
-					# Check Protocol Warning
-					proto_check=$(grep "proto udp" /etc/openvpn/server/server.conf)
-					if [[ ! -z "$proto_check" ]]; then
-						echo -e "${YELLOW}WARNING: OpenVPN is using UDP. HTTP Proxies typically only tunnel TCP.${NC}"
-						echo "Connecting via proxy might fail unless your proxy supports UDP tunneling (uncommon)."
-						read -p "Are you sure you want to continue? [y/N]: " confirm_proto
-						if [[ ! "$confirm_proto" =~ ^[yY]$ ]]; then
-							echo "Skipping proxy configuration for this client."
-							use_proxy="n"
+				read -p "Do you want to generate a second config WITH Proxy settings? [y/N]: " gen_proxy_file
+				if [[ "$gen_proxy_file" =~ ^[yY]$ ]]; then
+					
+					# Get public IP for proxy
+					proxy_ip=$(grep "remote " /etc/openvpn/server/client-common.txt | awk '{print $2}')
+					
+					# Ask for Port
+					echo
+					echo "Enter the Proxy Port you want to use."
+					read -p "Port [8080]: " proxy_port
+					[[ -z "$proxy_port" ]] && proxy_port="8080"
+
+					# Ask for Custom Header Host (Bug Host)
+					echo
+					echo "Enter Custom Header Host (e.g. m.youtube.com for spoofing):"
+					read -p "Host [m.youtube.com]: " proxy_host
+					[[ -z "$proxy_host" ]] && proxy_host="m.youtube.com"
+					
+					# Create Header String
+					# The user requested the proxy settings at the BEGINNING of the file
+					proxy_config_string="http-proxy $proxy_ip $proxy_port
+http-proxy-option VERSION 1.1
+http-proxy-option AGENT OpenVPN
+http-proxy-option CUSTOM-HEADER Host $proxy_host
+http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
+"
+					# Generate the Proxy Config File: proxy_string + standard_content
+					echo "$proxy_config_string" > "$script_dir"/"$client"-Proxy.ovpn
+					cat "$script_dir"/"$client".ovpn >> "$script_dir"/"$client"-Proxy.ovpn
+					
+					echo -e "${GREEN}Generated: $client-Proxy.ovpn${NC}"
+					
+					# --- ZIP AND UPLOAD LOGIC ---
+					echo
+					echo -e "${CYAN}Zipping and Uploading...${NC}"
+					
+					# Check for zip
+					if ! hash zip 2>/dev/null; then
+						echo "Installing zip..."
+						if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
+							apt-get update && apt-get install -y zip
+						else
+							dnf install -y zip
 						fi
 					fi
-
-					if [[ "$use_proxy" =~ ^[yY]$ ]]; then
-						# Get public IP
-						proxy_ip=$(grep "remote " /etc/openvpn/server/client-common.txt | awk '{print $2}')
-						
-						# Ask for Port
-						echo
-						echo "Enter the Proxy Port you want to assign to this client."
-						read -p "Port [8080]: " proxy_port
-						[[ -z "$proxy_port" ]] && proxy_port="8080"
-
-						# Ask for Custom Header Host (Bug Host)
-						echo
-						echo "Enter Custom Header Host (e.g. m.youtube.com for spoofing):"
-						read -p "Host [m.youtube.com]: " proxy_host
-						[[ -z "$proxy_host" ]] && proxy_host="m.youtube.com"
-						
-						# Add to .ovpn - MATCHING final.ovpn format
-						echo "http-proxy $proxy_ip $proxy_port" >> "$script_dir"/"$client".ovpn
-						echo "http-proxy-option VERSION 1.1" >> "$script_dir"/"$client".ovpn
-						echo "http-proxy-option AGENT OpenVPN" >> "$script_dir"/"$client".ovpn
-						echo "http-proxy-option CUSTOM-HEADER Host $proxy_host" >> "$script_dir"/"$client".ovpn
-						echo "http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host" >> "$script_dir"/"$client".ovpn
-						
-						echo -e "${GREEN}Proxy settings (No Auth) added to $client.ovpn${NC}"
+					
+					# Create Zip
+					cd "$script_dir"
+					zip_name="${client}.zip"
+					zip -q "$zip_name" "$client".ovpn "$client"-Proxy.ovpn
+					
+					# Check for curl
+					if ! hash curl 2>/dev/null; then
+						echo "Installing curl..."
+						if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
+							apt-get install -y curl
+						else
+							dnf install -y curl
+						fi
 					fi
+					
+					# Upload to 0x0.st
+					echo "Uploading to 0x0.st..."
+					upload_url=$(curl -s -F "file=@$zip_name" -H "User-Agent: MyUploader/1.0 (+mailto:you@example.com)" https://0x0.st)
+					
+					echo
+					echo -e "${GREEN}Upload Complete!${NC}"
+					echo -e "Download URL: ${YELLOW}$upload_url${NC}"
+					echo
 				fi
 			fi
 			# ---------------------------
 
 			echo
-			echo -e "${GREEN}$client added.${NC} Configuration available in: ${CYAN}$script_dir/$client.ovpn${NC}"
+			echo -e "${GREEN}$client added.${NC}"
 			exit
 		;;
 		2)
@@ -760,3 +796,5 @@ else
 		;;
 	esac
 fi
+
+}
