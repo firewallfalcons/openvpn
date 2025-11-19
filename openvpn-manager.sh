@@ -58,9 +58,9 @@ function header() {
     echo " | | | | '_ \ / _ \ '_ \|  \| | |_) |  \| |"
     echo " | |_| | |_) |  __/ | | | |\  |  __/| |\  |"
     echo "  \___/| .__/ \___|_| |_|_| \_|_|   |_| \_|"
-    echo "       |_|   MANAGER v2.5 (Pro Edition)"
+    echo "       |_|   MANAGER v2.6 (Pro Edition)"
     echo -e "${NC}"
-    echo -e "  ${YELLOW}Secure Squid Proxy${NC} | ${YELLOW}File.io Upload${NC} | ${YELLOW}Multi-Port${NC}"
+    echo "  Secure Squid Proxy | File.io Upload | Multi-Port"
     echo "  ─────────────────────────────────────────────"
     echo ""
 }
@@ -140,6 +140,15 @@ fi
 
 script_dir="$HOME"
 
+# Detect IP (Used for Squid ACLs later)
+if [[ $(ip -4 addr | grep inet | grep -vEc '127(\.[0-9]{1,3}){3}') -eq 1 ]]; then
+    ip=$(ip -4 addr | grep inet | grep -vE '127(\.[0-9]{1,3}){3}' | cut -d '/' -f 1 | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}')
+else
+    # Fallback simple detection for variable availability if multiple IPs exist but user hasn't selected yet
+    # The main install logic will refine this, but we need a value for Squid Option 3
+    ip=$(ip -4 addr | grep inet | grep -vE '127(\.[0-9]{1,3}){3}' | cut -d '/' -f 1 | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -1)
+fi
+
 # --- Logic Functions ---
 
 function upload_config() {
@@ -198,25 +207,8 @@ function install_squid() {
         dnf install -y squid >> "$LOG_FILE" 2>&1
     fi
 
-    # Detect OpenVPN Port
-    vpn_port_detect=$(grep '^port ' /etc/openvpn/server/server.conf 2>/dev/null | awk '{print $2}')
-    
     echo
     echo -e "${CYAN}>>> Configuration${NC}"
-    if [[ -n "$vpn_port_detect" ]]; then
-        echo -e "Detected OpenVPN Port: ${GREEN}$vpn_port_detect${NC}"
-        read -p "Allow tunneling only to this port? [Y/n]: " confirm_port
-        if [[ "$confirm_port" =~ ^[nN]$ ]]; then
-            read -p "Enter OpenVPN Target Port: " vpn_target_port
-        else
-            vpn_target_port="$vpn_port_detect"
-        fi
-    else
-        warning "OpenVPN config not detected."
-        read -p "Enter the OpenVPN Port to whitelist: " vpn_target_port
-    fi
-    
-    echo
     echo "Enter Squid Listen Ports (space separated)."
     read -p "Ports [3128 8080]: " squid_ports_input
     [[ -z "$squid_ports_input" ]] && squid_ports_input="3128 8080"
@@ -225,16 +217,21 @@ function install_squid() {
     mv /etc/squid/squid.conf /etc/squid/squid.conf.bak 2>/dev/null
 
     # Build Secure Config
+    # ALLOW: 127.0.0.0/8 (Localhost) and Current Public IP
     cat <<EOF > /etc/squid/squid.conf
 # Define Access Lists
 acl all src all
 acl CONNECT method CONNECT
-acl VPN_Port port $vpn_target_port
+
+# Localhost (127.0.0.1) and Public IP
+acl Local_IPs dst 127.0.0.0/8 ::1 $ip
 
 # SECURITY RULES
-# 1. Only allow CONNECT method (Tunneling) to the VPN Port
-http_access allow CONNECT VPN_Port
-# 2. Deny everything else (Stops open proxy abuse)
+# 1. Allow tunneling (CONNECT) to Localhost or Public IP on ANY PORT
+#    (Allows SSH tunneling, OpenVPN, internal services)
+http_access allow CONNECT Local_IPs
+
+# 2. Deny everything else (Stops access to external internet)
 http_access deny all
 
 # Squid Listen Ports
@@ -273,7 +270,7 @@ EOF
     echo
     success "Squid Proxy Installed & Secured."
     echo -e "    Ports: ${YELLOW}$squid_ports_input${NC}"
-    echo -e "    Allowed Tunnel: ${GREEN}Port $vpn_target_port Only${NC}"
+    echo -e "    Access: ${GREEN}Restricted to Localhost (127.0.0.1) & Server IP ($ip) ONLY${NC}"
     read -n1 -r -p "Press any key to continue..."
 }
 
@@ -313,7 +310,7 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
     echo -e "Please answer a few questions to setup your server."
     echo ""
 
-    # IP Detection
+    # IP Detection (Main)
     if [[ $(ip -4 addr | grep inet | grep -vEc '127(\.[0-9]{1,3}){3}') -eq 1 ]]; then
         ip=$(ip -4 addr | grep inet | grep -vE '127(\.[0-9]{1,3}){3}' | cut -d '/' -f 1 | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}')
     else
