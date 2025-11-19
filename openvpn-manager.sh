@@ -2,7 +2,7 @@
 #
 # https://github.com/Nyr/openvpn-install
 # 
-# Modified for 'ovpn' command and UI improvements + Squid Proxy
+# Modified for 'ovpn' command and UI improvements + Squid Proxy (No Auth / Multi-port)
 #
 
 # --- UI Colors ---
@@ -16,7 +16,7 @@ NC='\033[0m' # No Color
 function header() {
 	clear
 	echo -e "${GREEN}=================================================${NC}"
-	echo -e "${CYAN}          OPENVPN MANAGER v2.1                   ${NC}"
+	echo -e "${CYAN}          OPENVPN MANAGER v2.2 (No Auth)         ${NC}"
 	echo -e "${GREEN}=================================================${NC}"
 	echo ""
 }
@@ -96,38 +96,43 @@ script_dir="$HOME"
 # --- Squid Logic ---
 function install_squid() {
 	header
-	echo -e "${CYAN}Installing Squid Proxy...${NC}"
+	echo -e "${CYAN}Installing Squid Proxy (No Authentication)...${NC}"
 	
-	# Install packages
+	# Install packages (No need for apache2-utils/httpd-tools anymore as we removed auth)
 	if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
 		apt-get update
-		apt-get install -y squid apache2-utils
+		apt-get install -y squid
 	else
-		dnf install -y squid httpd-tools
+		dnf install -y squid
 	fi
 
-	# Ask for Port
+	# Ask for Ports (Multiple allowed)
 	echo
-	read -p "What port should Squid listen on? [3128]: " squid_port
-	[[ -z "$squid_port" ]] && squid_port="3128"
+	echo "Enter the ports Squid should listen on, separated by spaces."
+	read -p "Ports [3128 8080]: " squid_ports_input
+	[[ -z "$squid_ports_input" ]] && squid_ports_input="3128 8080"
 
 	# Backup original config
 	mv /etc/squid/squid.conf /etc/squid/squid.conf.bak 2>/dev/null
 
-	# Create Password File (Empty initially)
-	touch /etc/squid/passwd
-	chown proxy: /etc/squid/passwd 2>/dev/null
-	chmod 640 /etc/squid/passwd
-
-	# Write new Config
+	# Build the new config content
+	# Start with basic ACLs and headers
 	cat <<EOF > /etc/squid/squid.conf
-auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd
-auth_param basic children 5
-auth_param basic realm Squid Basic Authentication
-auth_param basic credentialsttl 2 hours
-acl auth_users proxy_auth REQUIRED
-http_access allow auth_users
-http_port $squid_port
+# Allow all access (No Authentication)
+acl all src all
+http_access allow all
+
+# Ports
+EOF
+
+	# Add http_port lines for each port specified
+	for port in $squid_ports_input; do
+		echo "http_port $port" >> /etc/squid/squid.conf
+	done
+
+	# Add remaining config
+	cat <<EOF >> /etc/squid/squid.conf
+
 coredump_dir /var/spool/squid
 refresh_pattern ^ftp:		1440	20%	10080
 refresh_pattern ^gopher:	1440	0%	1440
@@ -135,12 +140,16 @@ refresh_pattern -i (/cgi-bin/|\?) 0	0%	0
 refresh_pattern .		0	20%	4320
 EOF
 
-	# Firewall
+	# Firewall - Open all specified ports
 	if systemctl is-active --quiet firewalld.service; then
-		firewall-cmd --zone=public --add-port="$squid_port"/tcp
-		firewall-cmd --permanent --zone=public --add-port="$squid_port"/tcp
+		for port in $squid_ports_input; do
+			firewall-cmd --zone=public --add-port="$port"/tcp
+			firewall-cmd --permanent --zone=public --add-port="$port"/tcp
+		done
 	else
-		iptables -I INPUT -p tcp --dport "$squid_port" -j ACCEPT
+		for port in $squid_ports_input; do
+			iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+		done
 	fi
 
 	# Enable and Start
@@ -148,47 +157,8 @@ EOF
 	systemctl restart squid
 
 	echo
-	echo -e "${GREEN}Squid Proxy Installed on port $squid_port!${NC}"
-	echo "You can now add users via the main menu."
-	read -n1 -r -p "Press any key to continue..."
-}
-
-function add_squid_user() {
-	header
-	echo -e "${CYAN}Add Squid Proxy User${NC}"
-	read -p "Username: " squid_user
-	if [[ -z "$squid_user" ]]; then
-		echo "Invalid username."
-		sleep 2
-		return
-	fi
-	
-	# Create user
-	htpasswd -m /etc/squid/passwd "$squid_user"
-	if [[ $? -eq 0 ]]; then
-		systemctl reload squid
-		echo -e "${GREEN}User $squid_user added!${NC}"
-	else
-		echo -e "${RED}Failed to add user.${NC}"
-	fi
-	read -n1 -r -p "Press any key to continue..."
-}
-
-function remove_squid_user() {
-	header
-	echo -e "${CYAN}Remove Squid Proxy User${NC}"
-	read -p "Username to remove: " squid_user
-	if [[ -z "$squid_user" ]]; then
-		return
-	fi
-
-	htpasswd -D /etc/squid/passwd "$squid_user"
-	if [[ $? -eq 0 ]]; then
-		systemctl reload squid
-		echo -e "${GREEN}User $squid_user removed!${NC}"
-	else
-		echo -e "${RED}Failed to remove user (maybe didn't exist?).${NC}"
-	fi
+	echo -e "${GREEN}Squid Proxy Installed on ports: $squid_ports_input${NC}"
+	echo -e "${YELLOW}configured without authentication.${NC}"
 	read -n1 -r -p "Press any key to continue..."
 }
 
@@ -197,9 +167,9 @@ function remove_squid() {
 	read -p "Confirm Squid removal? [y/N]: " confirm
 	if [[ "$confirm" =~ ^[yY]$ ]]; then
 		if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
-			apt-get remove --purge -y squid apache2-utils
+			apt-get remove --purge -y squid
 		else
-			dnf remove -y squid httpd-tools
+			dnf remove -y squid
 		fi
 		rm -rf /etc/squid
 		echo -e "${GREEN}Squid removed.${NC}"
@@ -421,8 +391,6 @@ topology subnet
 server 10.8.0.0 255.255.255.0
 duplicate-cn" > /etc/openvpn/server/server.conf
     
-    # --- MODIFICATION: Added duplicate-cn above to allow multiple connections per user ---
-
 	# IPv6
 	if [[ -z "$ip6" ]]; then
 		echo 'push "redirect-gateway def1 bypass-dhcp"' >> /etc/openvpn/server/server.conf
@@ -598,17 +566,16 @@ else
 	echo -e "   2) ${YELLOW}Revoke an existing VPN client${NC}"
 	
 	if [ "$squid_installed" = true ]; then
-		echo -e "   3) ${CYAN}Manage Squid Proxy Users${NC}"
-		echo -e "   4) ${RED}Remove Squid Proxy${NC}"
+		echo -e "   3) ${RED}Remove Squid Proxy${NC}"
 	else
 		echo -e "   3) ${CYAN}Install Squid Proxy${NC}"
 	fi
 
-	echo -e "   5) ${RED}Remove OpenVPN${NC}"
-	echo -e "   6) ${CYAN}Exit${NC}"
+	echo -e "   4) ${RED}Remove OpenVPN${NC}"
+	echo -e "   5) ${CYAN}Exit${NC}"
 	
 	read -p "Option: " option
-	until [[ "$option" =~ ^[1-6]$ ]]; do
+	until [[ "$option" =~ ^[1-5]$ ]]; do
 		echo "$option: invalid selection."
 		read -p "Option: " option
 	done
@@ -629,7 +596,7 @@ else
 			# Build the .ovpn file
 			grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
 
-			# --- PROXY SUPPORT LOGIC ---
+			# --- PROXY SUPPORT LOGIC (NO AUTH + HEADERS) ---
 			if hash squid 2>/dev/null; then
 				echo
 				echo -e "${CYAN}Squid Proxy is detected.${NC}"
@@ -650,24 +617,27 @@ else
 					if [[ "$use_proxy" =~ ^[yY]$ ]]; then
 						# Get public IP
 						proxy_ip=$(grep "remote " /etc/openvpn/server/client-common.txt | awk '{print $2}')
-						# Get Squid port
-						proxy_port=$(grep "http_port" /etc/squid/squid.conf | awk '{print $2}')
-						[[ -z "$proxy_port" ]] && proxy_port="3128" # Fallback
 						
+						# Ask for Port
 						echo
-						echo "Detected Proxy IP: $proxy_ip"
-						echo "Detected Proxy Port: $proxy_port"
-						read -p "Use these settings? [Y/n]: " confirm_settings
-						if [[ "$confirm_settings" =~ ^[nN]$ ]]; then
-							read -p "Enter Proxy IP: " proxy_ip
-							read -p "Enter Proxy Port: " proxy_port
-						fi
+						echo "Enter the Proxy Port you want to assign to this client."
+						read -p "Port [8080]: " proxy_port
+						[[ -z "$proxy_port" ]] && proxy_port="8080"
+
+						# Ask for Custom Header Host (Bug Host)
+						echo
+						echo "Enter Custom Header Host (e.g. m.youtube.com for spoofing):"
+						read -p "Host [m.youtube.com]: " proxy_host
+						[[ -z "$proxy_host" ]] && proxy_host="m.youtube.com"
 						
-						# Add to .ovpn
+						# Add to .ovpn - MATCHING final.ovpn format
 						echo "http-proxy $proxy_ip $proxy_port" >> "$script_dir"/"$client".ovpn
-						echo "http-proxy-retry" >> "$script_dir"/"$client".ovpn
-						echo -e "${GREEN}Proxy settings added to $client.ovpn${NC}"
-						echo "The user will be prompted for Proxy Username/Password on connection."
+						echo "http-proxy-option VERSION 1.1" >> "$script_dir"/"$client".ovpn
+						echo "http-proxy-option AGENT OpenVPN" >> "$script_dir"/"$client".ovpn
+						echo "http-proxy-option CUSTOM-HEADER Host $proxy_host" >> "$script_dir"/"$client".ovpn
+						echo "http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host" >> "$script_dir"/"$client".ovpn
+						
+						echo -e "${GREEN}Proxy settings (No Auth) added to $client.ovpn${NC}"
 					fi
 				fi
 			fi
@@ -722,18 +692,7 @@ else
 		;;
 		3)
 			if [ "$squid_installed" = true ]; then
-				# Manage Users Submenu
-				header
-				echo "Squid User Management"
-				echo "1) Add Proxy User"
-				echo "2) Remove Proxy User"
-				echo "3) Back"
-				read -p "Option: " subopt
-				case "$subopt" in
-					1) add_squid_user ;;
-					2) remove_squid_user ;;
-					*) exit ;;
-				esac
+				remove_squid
 			else
 				# Install Squid
 				install_squid
@@ -741,14 +700,6 @@ else
 			exit
 		;;
 		4)
-			if [ "$squid_installed" = true ]; then
-				remove_squid
-			else
-				echo "Squid is not installed."
-			fi
-			exit
-		;;
-		5)
 			echo
 			echo -e "${RED}WARNING: This will remove OpenVPN and all configuration files.${NC}"
 			read -p "Confirm OpenVPN removal? [y/N]: " remove
@@ -804,7 +755,7 @@ else
 			fi
 			exit
 		;;
-		6)
+		5)
 			exit
 		;;
 	esac
