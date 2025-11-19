@@ -17,7 +17,7 @@ NC='\033[0m' # No Color
 function header() {
 	clear
 	echo -e "${GREEN}=================================================${NC}"
-	echo -e "${CYAN}      OPENVPN MANAGER v2.3 (Secure Proxy)        ${NC}"
+	echo -e "${CYAN}      OPENVPN MANAGER v2.4 (Menu Loop)           ${NC}"
 	echo -e "${GREEN}=================================================${NC}"
 	echo ""
 }
@@ -97,7 +97,7 @@ script_dir="$HOME"
 # --- Squid Logic ---
 function install_squid() {
 	header
-	echo -e "${CYAN}Installing Squid Proxy (VPN Users Only)...${NC}"
+	echo -e "${CYAN}Installing Squid Proxy (VPN Tunnel Only)...${NC}"
 	
 	# Install packages
 	if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
@@ -113,19 +113,47 @@ function install_squid() {
 	read -p "Ports [3128 8080]: " squid_ports_input
 	[[ -z "$squid_ports_input" ]] && squid_ports_input="3128 8080"
 
+	# Retrieve Server Public IP (Used for ACL to allow tunneling TO this server)
+	# We try to grab it from existing OpenVPN config if available, otherwise detect it.
+	if [[ -f /etc/openvpn/server/client-common.txt ]]; then
+		server_ip=$(grep "remote " /etc/openvpn/server/client-common.txt | awk '{print $2}')
+	fi
+	
+	# Fallback detection if file doesn't exist or failed
+	if [[ -z "$server_ip" ]]; then
+		server_ip=$(grep -m 1 -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' <<< "$(wget -T 10 -t 1 -4qO- "http://ip1.dynupdate.no-ip.com/" || curl -m 10 -4Ls "http://ip1.dynupdate.no-ip.com/")")
+	fi
+
+	echo -e "${YELLOW}Detected Server IP for ACL: $server_ip${NC}"
+
 	# Backup original config
 	mv /etc/squid/squid.conf /etc/squid/squid.conf.bak 2>/dev/null
 
 	# Build the new config content
-	# SECURITY UPDATE: ACLs restricted to VPN subnet and localhost
+	# SECURITY FIX: 
+	# 1. Allow VPN users (10.8.0.0/24) to use proxy for anything.
+	# 2. Allow ANYONE to connect *TO* the VPN Server IP (Tunneling).
+	# 3. Deny ANYONE from connecting to *OTHER* websites (prevents Open Proxy abuse).
+	
 	cat <<EOF > /etc/squid/squid.conf
 # Define networks
 acl vpn_net src 10.8.0.0/24
 acl localhost src 127.0.0.1/32
 
+# Define the destination that is THIS server
+acl to_vpn_server dst ${server_ip}/32 127.0.0.1/32
+
 # Access Control
+# 1. Allow localhost
 http_access allow localhost
+
+# 2. Allow connected VPN users to browse anywhere
 http_access allow vpn_net
+
+# 3. Allow outsiders to connect ONLY to this server (for OpenVPN Tunneling)
+http_access allow to_vpn_server
+
+# 4. Deny everything else (Block Open Proxy abuse)
 http_access deny all
 
 # Ports
@@ -146,7 +174,7 @@ refresh_pattern -i (/cgi-bin/|\?) 0	0%	0
 refresh_pattern .		0	20%	4320
 EOF
 
-	# Firewall - Open all specified ports (Necessary so they can connect to the IP, Squid ACL handles the reject)
+	# Firewall - Open all specified ports
 	if systemctl is-active --quiet firewalld.service; then
 		for port in $squid_ports_input; do
 			firewall-cmd --zone=public --add-port="$port"/tcp
@@ -164,7 +192,7 @@ EOF
 
 	echo
 	echo -e "${GREEN}Squid Proxy Installed on ports: $squid_ports_input${NC}"
-	echo -e "${YELLOW}Configured to allow ONLY OpenVPN users (10.8.0.0/24).${NC}"
+	echo -e "${YELLOW}Fixed: Allowed tunneling to $server_ip, blocked external browsing.${NC}"
 	read -n1 -r -p "Press any key to continue..."
 }
 
@@ -187,6 +215,7 @@ function remove_squid() {
 
 
 if [[ ! -e /etc/openvpn/server/server.conf ]]; then
+	# ... existing code for installation ...
 	header
 	# Detect some Debian minimal setups where neither wget nor curl are installed
 	if ! hash wget 2>/dev/null && ! hash curl 2>/dev/null; then
@@ -558,243 +587,246 @@ verb 3" > /etc/openvpn/server/client-common.txt
 	echo -e "The client configuration is available in: ${CYAN}$script_dir/$client.ovpn${NC}"
 	echo "You can manage users by typing 'ovpn' command."
 else
-	header
-	echo "OpenVPN is already installed."
-	echo
-	# Check if Squid is installed
-	squid_installed=false
-	if hash squid 2>/dev/null; then
-		squid_installed=true
-	fi
-	
-	echo "Select an option:"
-	echo -e "   1) ${GREEN}Add a new VPN client${NC}"
-	echo -e "   2) ${YELLOW}Revoke an existing VPN client${NC}"
-	
-	if [ "$squid_installed" = true ]; then
-		echo -e "   3) ${RED}Remove Squid Proxy${NC}"
-	else
-		echo -e "   3) ${CYAN}Install Squid Proxy${NC}"
-	fi
+	# START OF MENU LOOP
+	while true; do
+		header
+		echo "OpenVPN is already installed."
+		echo
+		# Check if Squid is installed
+		squid_installed=false
+		if hash squid 2>/dev/null; then
+			squid_installed=true
+		fi
+		
+		echo "Select an option:"
+		echo -e "   1) ${GREEN}Add a new VPN client${NC}"
+		echo -e "   2) ${YELLOW}Revoke an existing VPN client${NC}"
+		
+		if [ "$squid_installed" = true ]; then
+			echo -e "   3) ${RED}Remove Squid Proxy${NC}"
+		else
+			echo -e "   3) ${CYAN}Install Squid Proxy${NC}"
+		fi
 
-	echo -e "   4) ${RED}Remove OpenVPN${NC}"
-	echo -e "   5) ${CYAN}Exit${NC}"
-	
-	read -p "Option: " option
-	until [[ "$option" =~ ^[1-5]$ ]]; do
-		echo "$option: invalid selection."
+		echo -e "   4) ${RED}Remove OpenVPN${NC}"
+		echo -e "   5) ${CYAN}Exit${NC}"
+		
 		read -p "Option: " option
-	done
-	case "$option" in
-		1)
-			echo
-			echo "Provide a name for the client:"
-			read -p "Name: " unsanitized_client
-			client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
-			while [[ -z "$client" || -e /etc/openvpn/server/easy-rsa/pki/issued/"$client".crt ]]; do
-				echo "$client: invalid name."
+		until [[ "$option" =~ ^[1-5]$ ]]; do
+			echo "$option: invalid selection."
+			read -p "Option: " option
+		done
+		case "$option" in
+			1)
+				echo
+				echo "Provide a name for the client:"
 				read -p "Name: " unsanitized_client
 				client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
-			done
-			cd /etc/openvpn/server/easy-rsa/
-			./easyrsa --batch --days=3650 build-client-full "$client" nopass
-			
-			# 1. Build the STANDARD .ovpn file (No Proxy)
-			grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
+				while [[ -z "$client" || -e /etc/openvpn/server/easy-rsa/pki/issued/"$client".crt ]]; do
+					echo "$client: invalid name."
+					read -p "Name: " unsanitized_client
+					client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
+				done
+				cd /etc/openvpn/server/easy-rsa/
+				./easyrsa --batch --days=3650 build-client-full "$client" nopass
+				
+				# 1. Build the STANDARD .ovpn file (No Proxy)
+				grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
 
-			# --- PROXY SUPPORT LOGIC (AUTO-GENERATE SECOND FILE) ---
-			if hash squid 2>/dev/null; then
-				echo
-				echo -e "${CYAN}Squid Proxy is detected.${NC}"
-				read -p "Do you want to generate a second config WITH Proxy settings? [y/N]: " gen_proxy_file
-				if [[ "$gen_proxy_file" =~ ^[yY]$ ]]; then
-					
-					# Get public IP for proxy
-					proxy_ip=$(grep "remote " /etc/openvpn/server/client-common.txt | awk '{print $2}')
-					
-					# Ask for Port
+				# --- PROXY SUPPORT LOGIC (AUTO-GENERATE SECOND FILE) ---
+				if hash squid 2>/dev/null; then
 					echo
-					echo "Enter the Proxy Port you want to use."
-					read -p "Port [8080]: " proxy_port
-					[[ -z "$proxy_port" ]] && proxy_port="8080"
+					echo -e "${CYAN}Squid Proxy is detected.${NC}"
+					read -p "Do you want to generate a second config WITH Proxy settings? [y/N]: " gen_proxy_file
+					if [[ "$gen_proxy_file" =~ ^[yY]$ ]]; then
+						
+						# Get public IP for proxy
+						proxy_ip=$(grep "remote " /etc/openvpn/server/client-common.txt | awk '{print $2}')
+						
+						# Ask for Port
+						echo
+						echo "Enter the Proxy Port you want to use."
+						read -p "Port [8080]: " proxy_port
+						[[ -z "$proxy_port" ]] && proxy_port="8080"
 
-					# Ask for Custom Header Host (Bug Host)
-					echo
-					echo "Enter Custom Header Host (e.g. m.youtube.com for spoofing):"
-					read -p "Host [m.youtube.com]: " proxy_host
-					[[ -z "$proxy_host" ]] && proxy_host="m.youtube.com"
-					
-					# Create Header String
-					# The user requested the proxy settings at the BEGINNING of the file
-					proxy_config_string="http-proxy $proxy_ip $proxy_port
+						# Ask for Custom Header Host (Bug Host)
+						echo
+						echo "Enter Custom Header Host (e.g. m.youtube.com for spoofing):"
+						read -p "Host [m.youtube.com]: " proxy_host
+						[[ -z "$proxy_host" ]] && proxy_host="m.youtube.com"
+						
+						# Create Header String
+						# The user requested the proxy settings at the BEGINNING of the file
+						proxy_config_string="http-proxy $proxy_ip $proxy_port
 http-proxy-option VERSION 1.1
 http-proxy-option AGENT OpenVPN
 http-proxy-option CUSTOM-HEADER Host $proxy_host
 http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 "
-					# Generate the Proxy Config File: proxy_string + standard_content
-					echo "$proxy_config_string" > "$script_dir"/"$client"-Proxy.ovpn
-					cat "$script_dir"/"$client".ovpn >> "$script_dir"/"$client"-Proxy.ovpn
-					
-					echo -e "${GREEN}Generated: $client-Proxy.ovpn${NC}"
-					
-					# --- ZIP AND UPLOAD LOGIC ---
-					echo
-					echo -e "${CYAN}Zipping and Uploading...${NC}"
-					
-					# Check for zip
-					if ! hash zip 2>/dev/null; then
-						echo "Installing zip..."
-						if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
-							apt-get update && apt-get install -y zip
-						else
-							dnf install -y zip
+						# Generate the Proxy Config File: proxy_string + standard_content
+						echo "$proxy_config_string" > "$script_dir"/"$client"-Proxy.ovpn
+						cat "$script_dir"/"$client".ovpn >> "$script_dir"/"$client"-Proxy.ovpn
+						
+						echo -e "${GREEN}Generated: $client-Proxy.ovpn${NC}"
+						
+						# --- ZIP AND UPLOAD LOGIC ---
+						echo
+						echo -e "${CYAN}Zipping and Uploading...${NC}"
+						
+						# Check for zip
+						if ! hash zip 2>/dev/null; then
+							echo "Installing zip..."
+							if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
+								apt-get update && apt-get install -y zip
+							else
+								dnf install -y zip
+							fi
 						fi
-					fi
-					
-					# Create Zip
-					cd "$script_dir"
-					zip_name="${client}.zip"
-					zip -q "$zip_name" "$client".ovpn "$client"-Proxy.ovpn
-					
-					# Check for curl
-					if ! hash curl 2>/dev/null; then
-						echo "Installing curl..."
-						if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
-							apt-get install -y curl
-						else
-							dnf install -y curl
+						
+						# Create Zip
+						cd "$script_dir"
+						zip_name="${client}.zip"
+						zip -q "$zip_name" "$client".ovpn "$client"-Proxy.ovpn
+						
+						# Check for curl
+						if ! hash curl 2>/dev/null; then
+							echo "Installing curl..."
+							if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
+								apt-get install -y curl
+							else
+								dnf install -y curl
+							fi
 						fi
+						
+						# Upload to 0x0.st
+						echo "Uploading to 0x0.st..."
+						upload_url=$(curl -s -F "file=@$zip_name" -H "User-Agent: MyUploader/1.0 (+mailto:you@example.com)" https://0x0.st)
+						
+						echo
+						echo -e "${GREEN}Upload Complete!${NC}"
+						echo -e "Download URL: ${YELLOW}$upload_url${NC}"
+						echo
 					fi
-					
-					# Upload to 0x0.st
-					echo "Uploading to 0x0.st..."
-					upload_url=$(curl -s -F "file=@$zip_name" -H "User-Agent: MyUploader/1.0 (+mailto:you@example.com)" https://0x0.st)
-					
-					echo
-					echo -e "${GREEN}Upload Complete!${NC}"
-					echo -e "Download URL: ${YELLOW}$upload_url${NC}"
-					echo
 				fi
-			fi
-			# ---------------------------
+				# ---------------------------
 
-			echo
-			echo -e "${GREEN}$client added.${NC}"
-			exit
-		;;
-		2)
-			# This option could be documented a bit better and maybe even be simplified
-			# ...but what can I say, I want some sleep too
-			number_of_clients=$(tail -n +2 /etc/openvpn/server/easy-rsa/pki/index.txt | grep -c "^V")
-			if [[ "$number_of_clients" = 0 ]]; then
 				echo
-				echo "There are no existing clients!"
-				exit
-			fi
-			echo
-			echo "Select the client to revoke:"
-			tail -n +2 /etc/openvpn/server/easy-rsa/pki/index.txt | grep "^V" | cut -d '=' -f 2 | nl -s ') '
-			read -p "Client: " client_number
-			until [[ "$client_number" =~ ^[0-9]+$ && "$client_number" -le "$number_of_clients" ]]; do
-				echo "$client_number: invalid selection."
-				read -p "Client: " client_number
-			done
-			client=$(tail -n +2 /etc/openvpn/server/easy-rsa/pki/index.txt | grep "^V" | cut -d '=' -f 2 | sed -n "$client_number"p)
-			echo
-			echo -e "${YELLOW}WARNING: This will disconnect the user $client immediately.${NC}"
-			read -p "Confirm $client revocation? [y/N]: " revoke
-			until [[ "$revoke" =~ ^[yYnN]*$ ]]; do
-				echo "$revoke: invalid selection."
-				read -p "Confirm $client revocation? [y/N]: " revoke
-			done
-			if [[ "$revoke" =~ ^[yY]$ ]]; then
-				cd /etc/openvpn/server/easy-rsa/
-				./easyrsa --batch revoke "$client"
-				./easyrsa --batch --days=3650 gen-crl
-				rm -f /etc/openvpn/server/crl.pem
-				rm -f /etc/openvpn/server/easy-rsa/pki/reqs/"$client".req
-				rm -f /etc/openvpn/server/easy-rsa/pki/private/"$client".key
-				cp /etc/openvpn/server/easy-rsa/pki/crl.pem /etc/openvpn/server/crl.pem
-				# CRL is read with each client connection, when OpenVPN is dropped to nobody
-				chown nobody:"$group_name" /etc/openvpn/server/crl.pem
-				echo
-				echo -e "${GREEN}$client revoked!${NC}"
-			else
-				echo
-				echo "$client revocation aborted!"
-			fi
-			exit
-		;;
-		3)
-			if [ "$squid_installed" = true ]; then
-				remove_squid
-			else
-				# Install Squid
-				install_squid
-			fi
-			exit
-		;;
-		4)
-			echo
-			echo -e "${RED}WARNING: This will remove OpenVPN and all configuration files.${NC}"
-			read -p "Confirm OpenVPN removal? [y/N]: " remove
-			until [[ "$remove" =~ ^[yYnN]*$ ]]; do
-				echo "$remove: invalid selection."
-				read -p "Confirm OpenVPN removal? [y/N]: " remove
-			done
-			if [[ "$remove" =~ ^[yY]$ ]]; then
-				port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
-				protocol=$(grep '^proto ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
-				if systemctl is-active --quiet firewalld.service; then
-					ip=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep '\-s 10.8.0.0/24 '"'"'!'"'"' -d 10.8.0.0/24' | grep -oE '[^ ]+$')
-					# Using both permanent and not permanent rules to avoid a firewalld reload.
-					firewall-cmd --remove-port="$port"/"$protocol"
-					firewall-cmd --zone=trusted --remove-source=10.8.0.0/24
-					firewall-cmd --permanent --remove-port="$port"/"$protocol"
-					firewall-cmd --permanent --zone=trusted --remove-source=10.8.0.0/24
-					firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
-					firewall-cmd --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
-					if grep -qs "server-ipv6" /etc/openvpn/server/server.conf; then
-						ip6=$(firewall-cmd --direct --get-rules ipv6 nat POSTROUTING | grep '\-s fddd:1194:1194:1194::/64 '"'"'!'"'"' -d fddd:1194:1194:1194::/64' | grep -oE '[^ ]+$')
-						firewall-cmd --zone=trusted --remove-source=fddd:1194:1194:1194::/64
-						firewall-cmd --permanent --zone=trusted --remove-source=fddd:1194:1194:1194::/64
-						firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
-						firewall-cmd --permanent --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
+				echo -e "${GREEN}$client added.${NC}"
+				read -n1 -r -p "Press any key to return to menu..."
+				;;
+			2)
+				# This option could be documented a bit better and maybe even be simplified
+				# ...but what can I say, I want some sleep too
+				number_of_clients=$(tail -n +2 /etc/openvpn/server/easy-rsa/pki/index.txt | grep -c "^V")
+				if [[ "$number_of_clients" = 0 ]]; then
+					echo
+					echo "There are no existing clients!"
+					read -n1 -r -p "Press any key to return to menu..."
+				else
+					echo
+					echo "Select the client to revoke:"
+					tail -n +2 /etc/openvpn/server/easy-rsa/pki/index.txt | grep "^V" | cut -d '=' -f 2 | nl -s ') '
+					read -p "Client: " client_number
+					until [[ "$client_number" =~ ^[0-9]+$ && "$client_number" -le "$number_of_clients" ]]; do
+						echo "$client_number: invalid selection."
+						read -p "Client: " client_number
+					done
+					client=$(tail -n +2 /etc/openvpn/server/easy-rsa/pki/index.txt | grep "^V" | cut -d '=' -f 2 | sed -n "$client_number"p)
+					echo
+					echo -e "${YELLOW}WARNING: This will disconnect the user $client immediately.${NC}"
+					read -p "Confirm $client revocation? [y/N]: " revoke
+					until [[ "$revoke" =~ ^[yYnN]*$ ]]; do
+						echo "$revoke: invalid selection."
+						read -p "Confirm $client revocation? [y/N]: " revoke
+					done
+					if [[ "$revoke" =~ ^[yY]$ ]]; then
+						cd /etc/openvpn/server/easy-rsa/
+						./easyrsa --batch revoke "$client"
+						./easyrsa --batch --days=3650 gen-crl
+						rm -f /etc/openvpn/server/crl.pem
+						rm -f /etc/openvpn/server/easy-rsa/pki/reqs/"$client".req
+						rm -f /etc/openvpn/server/easy-rsa/pki/private/"$client".key
+						cp /etc/openvpn/server/easy-rsa/pki/crl.pem /etc/openvpn/server/crl.pem
+						# CRL is read with each client connection, when OpenVPN is dropped to nobody
+						chown nobody:"$group_name" /etc/openvpn/server/crl.pem
+						echo
+						echo -e "${GREEN}$client revoked!${NC}"
+					else
+						echo
+						echo "$client revocation aborted!"
 					fi
+					read -n1 -r -p "Press any key to return to menu..."
+				fi
+				;;
+			3)
+				if [ "$squid_installed" = true ]; then
+					remove_squid
 				else
-					systemctl disable --now openvpn-iptables.service
-					rm -f /etc/systemd/system/openvpn-iptables.service
+					# Install Squid
+					install_squid
 				fi
-				if sestatus 2>/dev/null | grep "Current mode" | grep -q "enforcing" && [[ "$port" != 1194 ]]; then
-					semanage port -d -t openvpn_port_t -p "$protocol" "$port"
-				fi
-				systemctl disable --now openvpn-server@server.service
-				rm -f /etc/systemd/system/openvpn-server@server.service.d/disable-limitnproc.conf
-				rm -f /etc/sysctl.d/99-openvpn-forward.conf
-				if [[ "$os" = "debian" || "$os" = "ubuntu" ]]; then
-					rm -rf /etc/openvpn/server
-					apt-get remove --purge -y openvpn
+				;;
+			4)
+				echo
+				echo -e "${RED}WARNING: This will remove OpenVPN and all configuration files.${NC}"
+				read -p "Confirm OpenVPN removal? [y/N]: " remove
+				until [[ "$remove" =~ ^[yYnN]*$ ]]; do
+					echo "$remove: invalid selection."
+					read -p "Confirm OpenVPN removal? [y/N]: " remove
+				done
+				if [[ "$remove" =~ ^[yY]$ ]]; then
+					port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+					protocol=$(grep '^proto ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+					if systemctl is-active --quiet firewalld.service; then
+						ip=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep '\-s 10.8.0.0/24 '"'"'!'"'"' -d 10.8.0.0/24' | grep -oE '[^ ]+$')
+						# Using both permanent and not permanent rules to avoid a firewalld reload.
+						firewall-cmd --remove-port="$port"/"$protocol"
+						firewall-cmd --zone=trusted --remove-source=10.8.0.0/24
+						firewall-cmd --permanent --remove-port="$port"/"$protocol"
+						firewall-cmd --permanent --zone=trusted --remove-source=10.8.0.0/24
+						firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
+						firewall-cmd --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
+						if grep -qs "server-ipv6" /etc/openvpn/server/server.conf; then
+							ip6=$(firewall-cmd --direct --get-rules ipv6 nat POSTROUTING | grep '\-s fddd:1194:1194:1194::/64 '"'"'!'"'"' -d fddd:1194:1194:1194::/64' | grep -oE '[^ ]+$')
+							firewall-cmd --zone=trusted --remove-source=fddd:1194:1194:1194::/64
+							firewall-cmd --permanent --zone=trusted --remove-source=fddd:1194:1194:1194::/64
+							firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
+							firewall-cmd --permanent --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
+						fi
+					else
+						systemctl disable --now openvpn-iptables.service
+						rm -f /etc/systemd/system/openvpn-iptables.service
+					fi
+					if sestatus 2>/dev/null | grep "Current mode" | grep -q "enforcing" && [[ "$port" != 1194 ]]; then
+						semanage port -d -t openvpn_port_t -p "$protocol" "$port"
+					fi
+					systemctl disable --now openvpn-server@server.service
+					rm -f /etc/systemd/system/openvpn-server@server.service.d/disable-limitnproc.conf
+					rm -f /etc/sysctl.d/99-openvpn-forward.conf
+					if [[ "$os" = "debian" || "$os" = "ubuntu" ]]; then
+						rm -rf /etc/openvpn/server
+						apt-get remove --purge -y openvpn
+					else
+						# Else, OS must be CentOS or Fedora
+						dnf remove -y openvpn
+						rm -rf /etc/openvpn/server
+					fi
+					echo
+					echo -e "${GREEN}OpenVPN removed!${NC}"
+					# Optional: Remove the ovpn command itself
+					rm -f /usr/local/bin/ovpn
+					echo "Manager command 'ovpn' removed."
+					exit
 				else
-					# Else, OS must be CentOS or Fedora
-					dnf remove -y openvpn
-					rm -rf /etc/openvpn/server
+					echo
+					echo "OpenVPN removal aborted!"
 				fi
-				echo
-				echo -e "${GREEN}OpenVPN removed!${NC}"
-				# Optional: Remove the ovpn command itself
-				rm -f /usr/local/bin/ovpn
-				echo "Manager command 'ovpn' removed."
-			else
-				echo
-				echo "OpenVPN removal aborted!"
-			fi
-			exit
-		;;
-		5)
-			exit
-		;;
-	esac
+				;;
+			5)
+				exit 0
+				;;
+		esac
+	done
 fi
 
 }
