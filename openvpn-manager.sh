@@ -17,7 +17,7 @@ NC='\033[0m' # No Color
 function header() {
 	clear
 	echo -e "${GREEN}=================================================${NC}"
-	echo -e "${CYAN}      OPENVPN MANAGER v2.4 (Menu Loop)           ${NC}"
+	echo -e "${CYAN}      OPENVPN MANAGER v2.6 (Smart Fix)           ${NC}"
 	echo -e "${GREEN}=================================================${NC}"
 	echo ""
 }
@@ -97,64 +97,68 @@ script_dir="$HOME"
 # --- Squid Logic ---
 function install_squid() {
 	header
-	echo -e "${CYAN}Installing Squid Proxy (VPN Tunnel Only)...${NC}"
+	echo -e "${CYAN}Installing Smart Squid Proxy (Force-to-VPN)...${NC}"
 	
-	# Install packages
+	# 1. Get OpenVPN Info
+	ovpn_port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+	ovpn_proto=$(grep '^proto ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+
+	# WARNING FOR UDP
+	if [[ "$ovpn_proto" == "udp" ]]; then
+		echo
+		echo -e "${RED}WARNING: Your OpenVPN server is using UDP.${NC}"
+		echo -e "${YELLOW}Squid can only tunnel TCP. The 'Smart Proxy' redirection will likely FAIL${NC}"
+		echo -e "${YELLOW}because it tries to redirect TCP proxy traffic to a UDP listener.${NC}"
+		echo "It is highly recommended to reinstall OpenVPN with TCP protocol for this to work."
+		read -p "Do you want to proceed anyway? [y/N]: " proceed_udp
+		if [[ ! "$proceed_udp" =~ ^[yY]$ ]]; then
+			echo "Aborted."
+			return
+		fi
+	fi
+
+	# 2. Install packages
 	if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
 		apt-get update
 		apt-get install -y squid
+		# Debian/Ubuntu uses 'proxy' user for squid usually
+		squid_user="proxy"
 	else
 		dnf install -y squid
+		# RHEL/CentOS uses 'squid' user
+		squid_user="squid"
 	fi
 
-	# Ask for Ports (Multiple allowed)
+	# Verify Squid User Exists
+	if ! id "$squid_user" >/dev/null 2>&1; then
+		# Fallback check
+		if id "squid" >/dev/null 2>&1; then
+			squid_user="squid"
+		elif id "proxy" >/dev/null 2>&1; then
+			squid_user="proxy"
+		fi
+	fi
+
+	# 3. Ask for Ports (Multiple allowed)
 	echo
 	echo "Enter the ports Squid should listen on, separated by spaces."
 	read -p "Ports [3128 8080]: " squid_ports_input
 	[[ -z "$squid_ports_input" ]] && squid_ports_input="3128 8080"
 
-	# Retrieve Server Public IP (Used for ACL to allow tunneling TO this server)
-	# We try to grab it from existing OpenVPN config if available, otherwise detect it.
-	if [[ -f /etc/openvpn/server/client-common.txt ]]; then
-		server_ip=$(grep "remote " /etc/openvpn/server/client-common.txt | awk '{print $2}')
-	fi
-	
-	# Fallback detection if file doesn't exist or failed
-	if [[ -z "$server_ip" ]]; then
-		server_ip=$(grep -m 1 -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' <<< "$(wget -T 10 -t 1 -4qO- "http://ip1.dynupdate.no-ip.com/" || curl -m 10 -4Ls "http://ip1.dynupdate.no-ip.com/")")
-	fi
-
-	echo -e "${YELLOW}Detected Server IP for ACL: $server_ip${NC}"
-
-	# Backup original config
+	# 4. Build Squid Config
 	mv /etc/squid/squid.conf /etc/squid/squid.conf.bak 2>/dev/null
 
-	# Build the new config content
-	# SECURITY FIX: 
-	# 1. Allow VPN users (10.8.0.0/24) to use proxy for anything.
-	# 2. Allow ANYONE to connect *TO* the VPN Server IP (Tunneling).
-	# 3. Deny ANYONE from connecting to *OTHER* websites (prevents Open Proxy abuse).
-	
+	# SMART CONFIG:
 	cat <<EOF > /etc/squid/squid.conf
-# Define networks
-acl vpn_net src 10.8.0.0/24
-acl localhost src 127.0.0.1/32
-
-# Define the destination that is THIS server
-acl to_vpn_server dst ${server_ip}/32 127.0.0.1/32
-
 # Access Control
-# 1. Allow localhost
+# Allow localhost
+acl localhost src 127.0.0.1/32
 http_access allow localhost
 
-# 2. Allow connected VPN users to browse anywhere
-http_access allow vpn_net
-
-# 3. Allow outsiders to connect ONLY to this server (for OpenVPN Tunneling)
-http_access allow to_vpn_server
-
-# 4. Deny everything else (Block Open Proxy abuse)
-http_access deny all
+# Allow All (Secured by IPTABLES Redirection to VPN)
+# We must allow 'all' so Squid attempts the connection, allowing iptables to grab it.
+acl all src all
+http_access allow all
 
 # Ports
 EOF
@@ -174,25 +178,64 @@ refresh_pattern -i (/cgi-bin/|\?) 0	0%	0
 refresh_pattern .		0	20%	4320
 EOF
 
-	# Firewall - Open all specified ports
+	# 5. FIX OPENVPN BINDING (CRITICAL FOR REDIRECT TO LOCALHOST)
+	# If 'local IP' is set, OpenVPN ignores traffic redirected to 127.0.0.1
+	if grep -q "^local " /etc/openvpn/server/server.conf; then
+		echo
+		echo -e "${YELLOW}Configuring OpenVPN to listen on all interfaces (required for localhost redirect)...${NC}"
+		# Comment out the local line
+		sed -i 's/^local /;local /' /etc/openvpn/server/server.conf
+		# Restart OpenVPN to apply
+		systemctl restart openvpn-server@server.service
+		echo -e "${GREEN}OpenVPN restarted.${NC}"
+	fi
+
+	# 6. Firewall & Redirection Logic
 	if systemctl is-active --quiet firewalld.service; then
+		# FIREWALLD
 		for port in $squid_ports_input; do
 			firewall-cmd --zone=public --add-port="$port"/tcp
 			firewall-cmd --permanent --zone=public --add-port="$port"/tcp
 		done
+		
+		# Add Direct Rule for Redirection
+		firewall-cmd --permanent --direct --add-rule ipv4 nat OUTPUT 0 -p tcp -m owner --uid-owner "$squid_user" -j REDIRECT --to-ports "$ovpn_port"
+		firewall-cmd --reload
 	else
+		# IPTABLES
+		# Open Input Ports
 		for port in $squid_ports_input; do
 			iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
 		done
+		
+		# Add Redirection Rule immediately
+		iptables -t nat -A OUTPUT -p tcp -m owner --uid-owner "$squid_user" -j REDIRECT --to-ports "$ovpn_port"
+
+		# Persist in a separate service file
+		echo "[Unit]
+Description=Squid Smart Proxy Redirection
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$(command -v iptables) -t nat -A OUTPUT -p tcp -m owner --uid-owner $squid_user -j REDIRECT --to-ports $ovpn_port
+ExecStop=$(command -v iptables) -t nat -D OUTPUT -p tcp -m owner --uid-owner $squid_user -j REDIRECT --to-ports $ovpn_port
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target" > /etc/systemd/system/squid-redirect.service
+
+		systemctl enable --now squid-redirect.service
 	fi
 
-	# Enable and Start
+	# Enable and Start Squid
 	systemctl enable squid
 	systemctl restart squid
 
 	echo
-	echo -e "${GREEN}Squid Proxy Installed on ports: $squid_ports_input${NC}"
-	echo -e "${YELLOW}Fixed: Allowed tunneling to $server_ip, blocked external browsing.${NC}"
+	echo -e "${GREEN}Smart Squid Proxy Installed on ports: $squid_ports_input${NC}"
+	echo -e "${YELLOW}Traffic from Squid is now redirected to OpenVPN (Port $ovpn_port).${NC}"
+	echo -e "OpenVPN has been configured to listen on ALL interfaces to accept this traffic."
 	read -n1 -r -p "Press any key to continue..."
 }
 
@@ -200,6 +243,26 @@ function remove_squid() {
 	header
 	read -p "Confirm Squid removal? [y/N]: " confirm
 	if [[ "$confirm" =~ ^[yY]$ ]]; then
+		
+		# 1. Remove Redirect Rules
+		# Detect Squid user again just in case
+		if grep -q "proxy" /etc/passwd; then squid_user="proxy"; else squid_user="squid"; fi
+		ovpn_port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+
+		if systemctl is-active --quiet firewalld.service; then
+			firewall-cmd --permanent --direct --remove-rule ipv4 nat OUTPUT 0 -p tcp -m owner --uid-owner "$squid_user" -j REDIRECT --to-ports "$ovpn_port" 2>/dev/null
+			firewall-cmd --reload
+		else
+			# Disable the separate service we created
+			if [[ -f /etc/systemd/system/squid-redirect.service ]]; then
+				systemctl disable --now squid-redirect.service
+				rm -f /etc/systemd/system/squid-redirect.service
+				# Also clean up the running rule just in case
+				iptables -t nat -D OUTPUT -p tcp -m owner --uid-owner "$squid_user" -j REDIRECT --to-ports "$ovpn_port" 2>/dev/null
+			fi
+		fi
+
+		# 2. Remove Package
 		if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
 			apt-get remove --purge -y squid
 		else
@@ -411,8 +474,9 @@ ssbzSibBsu/6iGtCOGEoXJf//////////wIBAg==
 	chown nobody:"$group_name" /etc/openvpn/server/crl.pem
 	# Without +x in the directory, OpenVPN can't run a stat() on the CRL file
 	chmod o+x /etc/openvpn/server/
-	# Generate server.conf
-	echo "local $ip
+	# Generate server.conf (MODIFIED to listen on 0.0.0.0 by default for future compatibility)
+	# We leave the 'local' parameter commented out so it binds to all interfaces.
+	echo ";local $ip
 port $port
 proto $protocol
 dev tun
