@@ -14,7 +14,7 @@ NC='\033[0m' # No Color
 function header() {
 	clear
 	echo -e "${GREEN}=================================================${NC}"
-	echo -e "${CYAN}      OPENVPN MANAGER v3.1 (Auto-DL & Login Control) ${NC}"
+	echo -e "${CYAN}   OPENVPN MANAGER v3.3 (Fast & Multi-Link)      ${NC}"
 	echo -e "${GREEN}=================================================${NC}"
 	echo ""
 }
@@ -112,16 +112,34 @@ function setup_web_hosting() {
 	# SECURITY: Create a blank index.html to prevent directory listing of the root folder
 	touch /var/www/ovpn-config/index.html
 
-	# --- Firewall Configuration for Port 81 ---
-	if systemctl is-active --quiet firewalld.service; then
-		if ! firewall-cmd --zone=public --list-ports | grep -q "81/tcp"; then
-			firewall-cmd --zone=public --add-port=81/tcp
-			firewall-cmd --permanent --zone=public --add-port=81/tcp
+	# Only run firewall checks if port 81 isn't already open (Speeds up the loop)
+	# Simple check using netstat or ss to see if 81 is listening isn't enough for firewall,
+	# but we can assume if the VHost file exists, we did this already.
+	
+	config_exists=false
+	if [[ -f /etc/apache2/sites-enabled/ovpn-port81.conf || -f /etc/httpd/conf.d/ovpn-port81.conf ]]; then
+		config_exists=true
+	fi
+
+	if [ "$config_exists" = false ]; then
+		echo "Configuring Web Hosting for first time..."
+
+		# 1. Check UFW (Ubuntu Common)
+		if hash ufw 2>/dev/null && systemctl is-active --quiet ufw; then
+			ufw allow 81/tcp >/dev/null
 		fi
-	else
-		# IPTABLES
-		if ! iptables -C INPUT -p tcp --dport 81 -j ACCEPT 2>/dev/null; then
-			iptables -I INPUT -p tcp --dport 81 -j ACCEPT
+
+		# 2. Check Firewalld (CentOS/RHEL Common)
+		if systemctl is-active --quiet firewalld.service; then
+			if ! firewall-cmd --zone=public --list-ports | grep -q "81/tcp"; then
+				firewall-cmd --zone=public --add-port=81/tcp
+				firewall-cmd --permanent --zone=public --add-port=81/tcp
+			fi
+		else
+			# 3. IPTABLES (Fallback)
+			if ! iptables -C INPUT -p tcp --dport 81 -j ACCEPT 2>/dev/null; then
+				iptables -I INPUT -p tcp --dport 81 -j ACCEPT
+			fi
 		fi
 	fi
 
@@ -134,22 +152,18 @@ function setup_web_hosting() {
 			apt-get install -y apache2
 		fi
 		
-		# Enable headers module for "Content-Disposition"
-		a2enmod headers > /dev/null 2>&1
-
-		# Add Listen 81 if not present
-		if ! grep -q "Listen 81" /etc/apache2/ports.conf; then
-			echo "Listen 81" >> /etc/apache2/ports.conf
-		fi
-
-		# Create VHost
-		cat <<EOF > /etc/apache2/sites-available/ovpn-port81.conf
+		# Only configure if missing
+		if [[ ! -f /etc/apache2/sites-available/ovpn-port81.conf ]]; then
+			a2enmod headers > /dev/null 2>&1
+			if ! grep -q "Listen 81" /etc/apache2/ports.conf; then
+				echo "Listen 81" >> /etc/apache2/ports.conf
+			fi
+			cat <<EOF > /etc/apache2/sites-available/ovpn-port81.conf
 <VirtualHost *:81>
     DocumentRoot /var/www/ovpn-config
     <Directory /var/www/ovpn-config>
         Options +Indexes
         Require all granted
-        # Force Download for .ovpn and .zip files
         <FilesMatch "\.(ovpn|zip)$">
             ForceType application/octet-stream
             Header set Content-Disposition attachment
@@ -159,32 +173,26 @@ function setup_web_hosting() {
     CustomLog \${APACHE_LOG_DIR}/ovpn-access.log combined
 </VirtualHost>
 EOF
-		# Enable Site
-		if [[ ! -L /etc/apache2/sites-enabled/ovpn-port81.conf ]]; then
 			ln -s /etc/apache2/sites-available/ovpn-port81.conf /etc/apache2/sites-enabled/
+			systemctl restart apache2
 		fi
-		systemctl restart apache2
-
 	else
 		# CentOS / Fedora / RHEL
 		if ! hash httpd 2>/dev/null; then
 			echo "Installing Apache (httpd)..."
 			dnf install -y httpd
 		fi
-
-		# Add Listen 81
-		if ! grep -q "Listen 81" /etc/httpd/conf/httpd.conf; then
-			echo "Listen 81" >> /etc/httpd/conf/httpd.conf
-		fi
-
-		# Create VHost
-		cat <<EOF > /etc/httpd/conf.d/ovpn-port81.conf
+		
+		if [[ ! -f /etc/httpd/conf.d/ovpn-port81.conf ]]; then
+			if ! grep -q "Listen 81" /etc/httpd/conf/httpd.conf; then
+				echo "Listen 81" >> /etc/httpd/conf/httpd.conf
+			fi
+			cat <<EOF > /etc/httpd/conf.d/ovpn-port81.conf
 <VirtualHost *:81>
     DocumentRoot /var/www/ovpn-config
     <Directory /var/www/ovpn-config>
         Options +Indexes
         Require all granted
-        # Force Download for .ovpn and .zip files
         <FilesMatch "\.(ovpn|zip)$">
             ForceType application/octet-stream
             Header set Content-Disposition attachment
@@ -192,8 +200,9 @@ EOF
     </Directory>
 </VirtualHost>
 EOF
-		systemctl enable --now httpd
-		systemctl restart httpd
+			systemctl enable --now httpd
+			systemctl restart httpd
+		fi
 	fi
 }
 
@@ -650,6 +659,7 @@ ssbzSibBsu/6iGtCOGEoXJf//////////wIBAg==
 	chmod o+x /etc/openvpn/server/
 	# Generate server.conf (MODIFIED to listen on 0.0.0.0 by default for future compatibility)
 	# We leave the 'local' parameter commented out so it binds to all interfaces.
+	# MULTI-LOGIN (duplicate-cn) is ENABLED by default here.
 	echo ";local $ip
 port $port
 proto $protocol
@@ -874,8 +884,8 @@ else
 				# 1. Build the STANDARD .ovpn file (No Proxy)
 				grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
 				
-				# File to be hosted (Defaults to standard ovpn)
-				file_to_host="$client.ovpn"
+				# Default File (Standard)
+				# We don't use $file_to_host variable anymore, we copy both explicitly.
 
 				# --- PROXY SUPPORT LOGIC (AUTO-GENERATE SECOND FILE) ---
 				if hash squid 2>/dev/null; then
@@ -900,40 +910,17 @@ else
 						[[ -z "$proxy_host" ]] && proxy_host="m.youtube.com"
 						
 						# Create Header String
-						# The user requested the proxy settings at the BEGINNING of the file
 						proxy_config_string="http-proxy $proxy_ip $proxy_port
 http-proxy-option VERSION 1.1
 http-proxy-option AGENT OpenVPN
 http-proxy-option CUSTOM-HEADER Host $proxy_host
 http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 "
-						# Generate the Proxy Config File: proxy_string + standard_content
+						# Generate the Proxy Config File
 						echo "$proxy_config_string" > "$script_dir"/"$client"-Proxy.ovpn
 						cat "$script_dir"/"$client".ovpn >> "$script_dir"/"$client"-Proxy.ovpn
 						
 						echo -e "${GREEN}Generated: $client-Proxy.ovpn${NC}"
-						
-						# --- ZIP LOGIC ---
-						echo
-						echo -e "${CYAN}Zipping...${NC}"
-						
-						# Check for zip
-						if ! hash zip 2>/dev/null; then
-							echo "Installing zip..."
-							if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
-								apt-get update && apt-get install -y zip
-							else
-								dnf install -y zip
-							fi
-						fi
-						
-						# Create Zip
-						cd "$script_dir"
-						zip_name="${client}.zip"
-						zip -q "$zip_name" "$client".ovpn "$client"-Proxy.ovpn
-						
-						# Update host file to the zip
-						file_to_host="$zip_name"
 					fi
 				fi
 				# ---------------------------
@@ -942,17 +929,20 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 				setup_web_hosting
 				
 				# GENERATE RANDOM PATH (SECURITY OBFUSCATION)
-				# Generate a random 32 char alphanumeric string
 				random_path=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 32)
 				
 				# Create the random directory inside the webroot
 				mkdir -p "/var/www/ovpn-config/$random_path"
 				
-				# Copy the file to this random location
-				cd "$script_dir"
-				cp "$file_to_host" "/var/www/ovpn-config/$random_path/$file_to_host"
+				# Copy Standard File
+				cp "$script_dir/$client.ovpn" "/var/www/ovpn-config/$random_path/$client.ovpn"
 				
-				# Get Public IP again to display link
+				# Copy Proxy File if exists
+				if [[ -f "$script_dir/$client-Proxy.ovpn" ]]; then
+					cp "$script_dir/$client-Proxy.ovpn" "/var/www/ovpn-config/$random_path/$client-Proxy.ovpn"
+				fi
+				
+				# Get Public IP
 				if [[ -f /etc/openvpn/server/client-common.txt ]]; then
 					host_ip=$(grep "remote " /etc/openvpn/server/client-common.txt | awk '{print $2}')
 				else
@@ -961,8 +951,16 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 
 				echo
 				echo -e "${GREEN}$client added.${NC}"
-				echo -e "Download URL: ${YELLOW}http://$host_ip:81/$random_path/$file_to_host${NC}"
-				echo -e "${CYAN}(This URL is obfuscated and unique to this client)${NC}"
+				echo -e "------------------------------------------------"
+				echo -e "Standard Config:"
+				echo -e "${YELLOW}http://$host_ip:81/$random_path/$client.ovpn${NC}"
+				
+				if [[ -f "$script_dir/$client-Proxy.ovpn" ]]; then
+					echo -e "------------------------------------------------"
+					echo -e "Proxy Config:"
+					echo -e "${YELLOW}http://$host_ip:81/$random_path/$client-Proxy.ovpn${NC}"
+				fi
+				echo -e "------------------------------------------------"
 				
 				read -n1 -r -p "Press any key to return to menu..."
 				;;
