@@ -14,7 +14,7 @@ NC='\033[0m' # No Color
 function header() {
 	clear
 	echo -e "${GREEN}=================================================${NC}"
-	echo -e "${CYAN}  OPENVPN MANAGER v3.6 (FirewallFalcon)  ${NC}"
+	echo -e "${CYAN}  OPENVPN MANAGER v3.7 (Service Repair & Purge)  ${NC}"
 	echo -e "${GREEN}=================================================${NC}"
 	echo ""
 }
@@ -143,11 +143,17 @@ function setup_web_hosting() {
 
 	# --- Apache Configuration ---
 	if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
-		# Install Apache if missing
+		# 1. Install Apache if missing
 		if ! hash apache2 2>/dev/null; then
 			echo "Installing Apache2..."
 			apt-get update
 			apt-get install -y apache2
+		fi
+
+		# 2. REPAIR CHECK: If binary exists but service is missing (Failed to restart error fix)
+		if [[ $(systemctl show -p LoadState --value apache2) == "not-found" ]]; then
+			echo "Apache service unit not found. Attempting repair..."
+			apt-get install --reinstall -y apache2
 		fi
 		
 		# DISABLE STANDARD PORTS (80/443)
@@ -182,6 +188,10 @@ function setup_web_hosting() {
 </VirtualHost>
 EOF
 			ln -s /etc/apache2/sites-available/ovpn-port81.conf /etc/apache2/sites-enabled/
+			
+			# FORCE ENABLE AND RESTART
+			systemctl daemon-reload
+			systemctl enable apache2
 			systemctl restart apache2
 		fi
 	else
@@ -189,6 +199,12 @@ EOF
 		if ! hash httpd 2>/dev/null; then
 			echo "Installing Apache (httpd)..."
 			dnf install -y httpd
+		fi
+		
+		# Repair check for RHEL systems
+		if [[ $(systemctl show -p LoadState --value httpd) == "not-found" ]]; then
+			echo "Httpd service unit not found. Attempting repair..."
+			dnf reinstall -y httpd
 		fi
 		
 		# DISABLE STANDARD PORTS (80)
