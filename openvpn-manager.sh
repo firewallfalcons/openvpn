@@ -1,7 +1,5 @@
 #!/bin/bash
 #
-# https://github.com/Nyr/openvpn-install
-# 
 #
 
 # --- UI Colors ---
@@ -16,7 +14,7 @@ NC='\033[0m' # No Color
 function header() {
 	clear
 	echo -e "${GREEN}=================================================${NC}"
-	echo -e "${CYAN}      OPENVPN MANAGER v3.0 (Secure Host)         ${NC}"
+	echo -e "${CYAN}      OPENVPN MANAGER v3.1 (Auto-DL & Login Control) ${NC}"
 	echo -e "${GREEN}=================================================${NC}"
 	echo ""
 }
@@ -29,12 +27,20 @@ function show_dashboard() {
 		ovpn_status="${GREEN}ACTIVE${NC}"
 		ovpn_port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
 		ovpn_proto=$(grep '^proto ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+		
+		# Check duplicate-cn status
+		if grep -q "^duplicate-cn" /etc/openvpn/server/server.conf; then
+			login_mode="${GREEN}Multi-Device${NC}"
+		else
+			login_mode="${YELLOW}Single-Device${NC}"
+		fi
 	else
 		ovpn_status="${RED}INACTIVE${NC}"
 		ovpn_port="N/A"
 		ovpn_proto=""
+		login_mode="N/A"
 	fi
-	echo -e "OpenVPN:  $ovpn_status  [Port: $ovpn_port/$ovpn_proto]"
+	echo -e "OpenVPN:  $ovpn_status  [Port: $ovpn_port/$ovpn_proto] [Mode: $login_mode]"
 
 	# 2. Squid Status
 	if hash squid 2>/dev/null && systemctl is-active --quiet squid; then
@@ -72,6 +78,32 @@ function show_dashboard() {
 	echo ""
 }
 
+function toggle_duplicate_cn() {
+	echo
+	echo -e "${CYAN}Toggling Multi-Login Settings...${NC}"
+	
+	if grep -q "^duplicate-cn" /etc/openvpn/server/server.conf; then
+		# Currently Enabled -> Disable it
+		sed -i 's/^duplicate-cn/;duplicate-cn/' /etc/openvpn/server/server.conf
+		echo -e "Status changed to: ${YELLOW}Single-Device Only${NC}"
+		echo "Users can now only connect from one device at a time."
+	else
+		# Currently Disabled -> Enable it
+		if grep -q "^;duplicate-cn" /etc/openvpn/server/server.conf; then
+			sed -i 's/^;duplicate-cn/duplicate-cn/' /etc/openvpn/server/server.conf
+		else
+			echo "duplicate-cn" >> /etc/openvpn/server/server.conf
+		fi
+		echo -e "Status changed to: ${GREEN}Multi-Device Allowed${NC}"
+		echo "Users can now connect multiple devices simultaneously."
+	fi
+	
+	# Restart OpenVPN
+	systemctl restart openvpn-server@server.service
+	echo "OpenVPN restarted to apply changes."
+	read -n1 -r -p "Press any key to return to menu..."
+}
+
 function setup_web_hosting() {
 	# Ensure storage directory exists
 	mkdir -p /var/www/ovpn-config
@@ -101,6 +133,9 @@ function setup_web_hosting() {
 			apt-get update
 			apt-get install -y apache2
 		fi
+		
+		# Enable headers module for "Content-Disposition"
+		a2enmod headers > /dev/null 2>&1
 
 		# Add Listen 81 if not present
 		if ! grep -q "Listen 81" /etc/apache2/ports.conf; then
@@ -114,6 +149,11 @@ function setup_web_hosting() {
     <Directory /var/www/ovpn-config>
         Options +Indexes
         Require all granted
+        # Force Download for .ovpn and .zip files
+        <FilesMatch "\.(ovpn|zip)$">
+            ForceType application/octet-stream
+            Header set Content-Disposition attachment
+        </FilesMatch>
     </Directory>
     ErrorLog \${APACHE_LOG_DIR}/ovpn-error.log
     CustomLog \${APACHE_LOG_DIR}/ovpn-access.log combined
@@ -144,6 +184,11 @@ EOF
     <Directory /var/www/ovpn-config>
         Options +Indexes
         Require all granted
+        # Force Download for .ovpn and .zip files
+        <FilesMatch "\.(ovpn|zip)$">
+            ForceType application/octet-stream
+            Header set Content-Disposition attachment
+        </FilesMatch>
     </Directory>
 </VirtualHost>
 EOF
@@ -796,18 +841,19 @@ else
 		echo "Select an option:"
 		echo -e "   1) ${GREEN}Add a new VPN client${NC}"
 		echo -e "   2) ${YELLOW}Revoke an existing VPN client${NC}"
+		echo -e "   3) ${PURPLE}Toggle Multi-Login (Currently: $login_mode)${NC}"
 		
 		if [ "$squid_installed" = true ]; then
-			echo -e "   3) ${RED}Remove Squid Proxy${NC}"
+			echo -e "   4) ${RED}Remove Squid Proxy${NC}"
 		else
-			echo -e "   3) ${CYAN}Install Squid Proxy${NC}"
+			echo -e "   4) ${CYAN}Install Squid Proxy${NC}"
 		fi
 
-		echo -e "   4) ${RED}Remove OpenVPN & Web Host${NC}"
-		echo -e "   5) ${CYAN}Exit${NC}"
+		echo -e "   5) ${RED}Remove OpenVPN & Web Host${NC}"
+		echo -e "   6) ${CYAN}Exit${NC}"
 		
 		read -p "Option: " option
-		until [[ "$option" =~ ^[1-5]$ ]]; do
+		until [[ "$option" =~ ^[1-6]$ ]]; do
 			echo "$option: invalid selection."
 			read -p "Option: " option
 		done
@@ -965,6 +1011,9 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 				fi
 				;;
 			3)
+				toggle_duplicate_cn
+				;;
+			4)
 				if [ "$squid_installed" = true ]; then
 					remove_squid
 				else
@@ -972,7 +1021,7 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 					install_squid
 				fi
 				;;
-			4)
+			5)
 				echo
 				echo -e "${RED}WARNING: This will remove OpenVPN and all configuration files.${NC}"
 				read -p "Confirm OpenVPN removal? [y/N]: " remove
@@ -1041,7 +1090,7 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 					echo "OpenVPN removal aborted!"
 				fi
 				;;
-			5)
+			6)
 				exit 0
 				;;
 		esac
