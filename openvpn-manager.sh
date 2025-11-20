@@ -14,7 +14,7 @@ NC='\033[0m' # No Color
 function header() {
 	clear
 	echo -e "${GREEN}=================================================${NC}"
-	echo -e "${CYAN}   OPENVPN MANAGER v3.3 (Fast & Multi-Link)      ${NC}"
+	echo -e "${CYAN}   OPENVPN MANAGER v3.4     ${NC}"
 	echo -e "${GREEN}=================================================${NC}"
 	echo ""
 }
@@ -66,8 +66,14 @@ function show_dashboard() {
 			web_status="${GREEN}ACTIVE${NC}"
 			web_port="81"
 		else
-			web_status="${YELLOW}RUNNING (No VPN Config)${NC}"
-			web_port="80/443"
+			# If Listen 81 is still in ports.conf but config is gone, it's a zombie state
+			if grep -q "Listen 81" /etc/apache2/ports.conf 2>/dev/null || grep -q "Listen 81" /etc/httpd/conf/httpd.conf 2>/dev/null; then
+				web_status="${RED}ZOMBIE (Port 81 Open)${NC}"
+				web_port="81"
+			else
+				web_status="${YELLOW}RUNNING (No VPN Config)${NC}"
+				web_port="80/443"
+			fi
 		fi
 	else
 		web_status="${RED}INACTIVE${NC}"
@@ -1063,6 +1069,10 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 						# CLEAN APACHE
 						rm -f /etc/apache2/sites-enabled/ovpn-port81.conf
 						rm -f /etc/apache2/sites-available/ovpn-port81.conf
+						
+						# REMOVE LISTEN 81 from ports.conf
+						sed -i '/Listen 81/d' /etc/apache2/ports.conf
+						
 						systemctl restart apache2
 					else
 						# Else, OS must be CentOS or Fedora
@@ -1071,6 +1081,10 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 						
 						# CLEAN APACHE
 						rm -f /etc/httpd/conf.d/ovpn-port81.conf
+						
+						# REMOVE LISTEN 81 from httpd.conf
+						sed -i '/Listen 81/d' /etc/httpd/conf/httpd.conf
+						
 						systemctl restart httpd
 					fi
 					
