@@ -14,7 +14,7 @@ NC='\033[0m' # No Color
 function header() {
 	clear
 	echo -e "${GREEN}=================================================${NC}"
-	echo -e "${CYAN}   OPENVPN MANAGER v3.4     ${NC}"
+	echo -e "${CYAN}  OPENVPN MANAGER v3.6 (FirewallFalcon)  ${NC}"
 	echo -e "${GREEN}=================================================${NC}"
 	echo ""
 }
@@ -64,16 +64,10 @@ function show_dashboard() {
 		# Check if our config exists
 		if [[ -f /etc/apache2/sites-enabled/ovpn-port81.conf || -f /etc/httpd/conf.d/ovpn-port81.conf ]]; then
 			web_status="${GREEN}ACTIVE${NC}"
-			web_port="81"
+			web_port="81 (Exclusive)"
 		else
-			# If Listen 81 is still in ports.conf but config is gone, it's a zombie state
-			if grep -q "Listen 81" /etc/apache2/ports.conf 2>/dev/null || grep -q "Listen 81" /etc/httpd/conf/httpd.conf 2>/dev/null; then
-				web_status="${RED}ZOMBIE (Port 81 Open)${NC}"
-				web_port="81"
-			else
-				web_status="${YELLOW}RUNNING (No VPN Config)${NC}"
-				web_port="80/443"
-			fi
+			web_status="${YELLOW}RUNNING (Default Config)${NC}"
+			web_port="?"
 		fi
 	else
 		web_status="${RED}INACTIVE${NC}"
@@ -118,17 +112,15 @@ function setup_web_hosting() {
 	# SECURITY: Create a blank index.html to prevent directory listing of the root folder
 	touch /var/www/ovpn-config/index.html
 
-	# Only run firewall checks if port 81 isn't already open (Speeds up the loop)
-	# Simple check using netstat or ss to see if 81 is listening isn't enough for firewall,
-	# but we can assume if the VHost file exists, we did this already.
-	
+	# Check if config is missing
 	config_exists=false
 	if [[ -f /etc/apache2/sites-enabled/ovpn-port81.conf || -f /etc/httpd/conf.d/ovpn-port81.conf ]]; then
 		config_exists=true
 	fi
 
+	# Only run setup/repair if config is missing
 	if [ "$config_exists" = false ]; then
-		echo "Configuring Web Hosting for first time..."
+		echo "Initializing Web Hosting on Port 81..."
 
 		# 1. Check UFW (Ubuntu Common)
 		if hash ufw 2>/dev/null && systemctl is-active --quiet ufw; then
@@ -158,7 +150,17 @@ function setup_web_hosting() {
 			apt-get install -y apache2
 		fi
 		
-		# Only configure if missing
+		# DISABLE STANDARD PORTS (80/443)
+		# We comment out any line starting with Listen 80 or Listen 443
+		sed -i 's/^Listen 80/#Listen 80/' /etc/apache2/ports.conf
+		sed -i 's/^Listen 443/#Listen 443/' /etc/apache2/ports.conf
+		
+		# Disable default site (Welcome to Apache)
+		if [[ -f /etc/apache2/sites-enabled/000-default.conf ]]; then
+			a2dissite 000-default >/dev/null 2>&1
+		fi
+
+		# Only configure VHost if missing
 		if [[ ! -f /etc/apache2/sites-available/ovpn-port81.conf ]]; then
 			a2enmod headers > /dev/null 2>&1
 			if ! grep -q "Listen 81" /etc/apache2/ports.conf; then
@@ -188,6 +190,9 @@ EOF
 			echo "Installing Apache (httpd)..."
 			dnf install -y httpd
 		fi
+		
+		# DISABLE STANDARD PORTS (80)
+		sed -i 's/^Listen 80/#Listen 80/' /etc/httpd/conf/httpd.conf
 		
 		if [[ ! -f /etc/httpd/conf.d/ovpn-port81.conf ]]; then
 			if ! grep -q "Listen 81" /etc/httpd/conf/httpd.conf; then
@@ -428,44 +433,6 @@ WantedBy=multi-user.target" > /etc/systemd/system/squid-redirect.service
 	echo -e "OpenVPN has been configured to listen on ALL interfaces to accept this traffic."
 	read -n1 -r -p "Press any key to continue..."
 }
-
-function remove_squid() {
-	header
-	read -p "Confirm Squid removal? [y/N]: " confirm
-	if [[ "$confirm" =~ ^[yY]$ ]]; then
-		
-		# 1. Remove Redirect Rules
-		# Detect Squid user again just in case
-		if grep -q "proxy" /etc/passwd; then squid_user="proxy"; else squid_user="squid"; fi
-		ovpn_port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
-
-		if systemctl is-active --quiet firewalld.service; then
-			firewall-cmd --permanent --direct --remove-rule ipv4 nat OUTPUT 0 -p tcp -m owner --uid-owner "$squid_user" -j REDIRECT --to-ports "$ovpn_port" 2>/dev/null
-			firewall-cmd --reload
-		else
-			# Disable the separate service we created
-			if [[ -f /etc/systemd/system/squid-redirect.service ]]; then
-				systemctl disable --now squid-redirect.service
-				rm -f /etc/systemd/system/squid-redirect.service
-				# Also clean up the running rule just in case
-				iptables -t nat -D OUTPUT -p tcp -m owner --uid-owner "$squid_user" -j REDIRECT --to-ports "$ovpn_port" 2>/dev/null
-			fi
-		fi
-
-		# 2. Remove Package
-		if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
-			apt-get remove --purge -y squid
-		else
-			dnf remove -y squid
-		fi
-		rm -rf /etc/squid
-		echo -e "${GREEN}Squid removed.${NC}"
-	else
-		echo "Cancelled."
-	fi
-	read -n1 -r -p "Press any key to continue..."
-}
-
 
 if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 	# ... existing code for installation ...
@@ -835,6 +802,10 @@ verb 3" > /etc/openvpn/server/client-common.txt
 	systemctl enable --now openvpn-server@server.service
 	# Build the $client.ovpn file, stripping comments from easy-rsa in the process
 	grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
+	
+	# --- FORCE PORT 81 SETUP (FIX FOR DASHBOARD) ---
+	setup_web_hosting
+	
 	echo
 	echo -e "${GREEN}Finished!${NC}"
 	echo
@@ -842,6 +813,12 @@ verb 3" > /etc/openvpn/server/client-common.txt
 	echo "You can manage users by typing 'ovpn' command."
 else
 	# START OF MENU LOOP
+	
+	# Check if Port 81 hosting is set up (Fix for existing installs)
+	if [[ ! -f /etc/apache2/sites-enabled/ovpn-port81.conf && ! -f /etc/httpd/conf.d/ovpn-port81.conf ]]; then
+		setup_web_hosting
+	fi
+
 	while true; do
 		header
 		
@@ -1066,29 +1043,25 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 						rm -rf /etc/openvpn/server
 						apt-get remove --purge -y openvpn
 						
-						# CLEAN APACHE
-						rm -f /etc/apache2/sites-enabled/ovpn-port81.conf
-						rm -f /etc/apache2/sites-available/ovpn-port81.conf
-						
-						# REMOVE LISTEN 81 from ports.conf
-						sed -i '/Listen 81/d' /etc/apache2/ports.conf
-						
-						systemctl restart apache2
+						# REMOVE APACHE COMPLETELY
+						echo "Removing Apache..."
+						systemctl stop apache2
+						apt-get remove --purge -y apache2 apache2-utils apache2-bin apache2.2-common
+						apt-get autoremove -y
+						rm -rf /etc/apache2 /var/www/html /var/www/ovpn-config
 					else
 						# Else, OS must be CentOS or Fedora
 						dnf remove -y openvpn
 						rm -rf /etc/openvpn/server
 						
-						# CLEAN APACHE
-						rm -f /etc/httpd/conf.d/ovpn-port81.conf
-						
-						# REMOVE LISTEN 81 from httpd.conf
-						sed -i '/Listen 81/d' /etc/httpd/conf/httpd.conf
-						
-						systemctl restart httpd
+						# REMOVE APACHE COMPLETELY
+						echo "Removing Apache..."
+						systemctl stop httpd
+						dnf remove -y httpd
+						rm -rf /etc/httpd /var/www/html /var/www/ovpn-config
 					fi
 					
-					# Clean Web Directory
+					# Clean Web Directory (Redundant but safe)
 					rm -rf /var/www/ovpn-config
 
 					echo
