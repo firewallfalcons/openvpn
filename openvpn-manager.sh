@@ -2,8 +2,6 @@
 #
 # https://github.com/Nyr/openvpn-install
 # 
-# Modified for 'ovpn' command, UI improvements, Secure Squid Proxy,
-# Dual Config Generation, Zip, and Secure Apache Port 81 Hosting.
 #
 
 # --- UI Colors ---
