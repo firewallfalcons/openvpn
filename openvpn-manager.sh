@@ -3,7 +3,7 @@
 # https://github.com/Nyr/openvpn-install
 # 
 # Modified for 'ovpn' command, UI improvements, Secure Squid Proxy,
-# Dual Config Generation, Zip, and 0x0.st Upload.
+# Dual Config Generation, Zip, and Secure Apache Port 81 Hosting.
 #
 
 # --- UI Colors ---
@@ -11,15 +11,147 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
+PURPLE='\033[0;35m'
 NC='\033[0m' # No Color
 
 # --- Helper Functions ---
 function header() {
 	clear
 	echo -e "${GREEN}=================================================${NC}"
-	echo -e "${CYAN}      OPENVPN MANAGER v2.6 (Smart Fix)           ${NC}"
+	echo -e "${CYAN}      OPENVPN MANAGER v3.0 (Secure Host)         ${NC}"
 	echo -e "${GREEN}=================================================${NC}"
 	echo ""
+}
+
+function show_dashboard() {
+	echo -e "${PURPLE}--- SERVICE STATUS ---${NC}"
+	
+	# 1. OpenVPN Status
+	if systemctl is-active --quiet openvpn-server@server.service; then
+		ovpn_status="${GREEN}ACTIVE${NC}"
+		ovpn_port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+		ovpn_proto=$(grep '^proto ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+	else
+		ovpn_status="${RED}INACTIVE${NC}"
+		ovpn_port="N/A"
+		ovpn_proto=""
+	fi
+	echo -e "OpenVPN:  $ovpn_status  [Port: $ovpn_port/$ovpn_proto]"
+
+	# 2. Squid Status
+	if hash squid 2>/dev/null && systemctl is-active --quiet squid; then
+		squid_status="${GREEN}ACTIVE${NC}"
+		# Extract ports from squid.conf (simple grep)
+		squid_ports=$(grep "^http_port" /etc/squid/squid.conf | awk '{print $2}' | tr '\n' ' ')
+	elif hash squid 2>/dev/null; then
+		squid_status="${RED}STOPPED${NC}"
+		squid_ports="N/A"
+	else
+		squid_status="${YELLOW}NOT INSTALLED${NC}"
+		squid_ports=""
+	fi
+	echo -e "Squid:    $squid_status  [Ports: $squid_ports]"
+
+	# 3. Web Host Status (Apache Port 81)
+	web_service="apache2"
+	if [[ "$os" == "centos" || "$os" == "fedora" ]]; then web_service="httpd"; fi
+	
+	if systemctl is-active --quiet $web_service; then
+		# Check if our config exists
+		if [[ -f /etc/apache2/sites-enabled/ovpn-port81.conf || -f /etc/httpd/conf.d/ovpn-port81.conf ]]; then
+			web_status="${GREEN}ACTIVE${NC}"
+			web_port="81"
+		else
+			web_status="${YELLOW}RUNNING (No VPN Config)${NC}"
+			web_port="80/443"
+		fi
+	else
+		web_status="${RED}INACTIVE${NC}"
+		web_port="N/A"
+	fi
+	echo -e "Hosting:  $web_status  [Port: $web_port]"
+	echo -e "${PURPLE}----------------------${NC}"
+	echo ""
+}
+
+function setup_web_hosting() {
+	# Ensure storage directory exists
+	mkdir -p /var/www/ovpn-config
+	chmod 755 /var/www/ovpn-config
+	
+	# SECURITY: Create a blank index.html to prevent directory listing of the root folder
+	touch /var/www/ovpn-config/index.html
+
+	# --- Firewall Configuration for Port 81 ---
+	if systemctl is-active --quiet firewalld.service; then
+		if ! firewall-cmd --zone=public --list-ports | grep -q "81/tcp"; then
+			firewall-cmd --zone=public --add-port=81/tcp
+			firewall-cmd --permanent --zone=public --add-port=81/tcp
+		fi
+	else
+		# IPTABLES
+		if ! iptables -C INPUT -p tcp --dport 81 -j ACCEPT 2>/dev/null; then
+			iptables -I INPUT -p tcp --dport 81 -j ACCEPT
+		fi
+	fi
+
+	# --- Apache Configuration ---
+	if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
+		# Install Apache if missing
+		if ! hash apache2 2>/dev/null; then
+			echo "Installing Apache2..."
+			apt-get update
+			apt-get install -y apache2
+		fi
+
+		# Add Listen 81 if not present
+		if ! grep -q "Listen 81" /etc/apache2/ports.conf; then
+			echo "Listen 81" >> /etc/apache2/ports.conf
+		fi
+
+		# Create VHost
+		cat <<EOF > /etc/apache2/sites-available/ovpn-port81.conf
+<VirtualHost *:81>
+    DocumentRoot /var/www/ovpn-config
+    <Directory /var/www/ovpn-config>
+        Options +Indexes
+        Require all granted
+    </Directory>
+    ErrorLog \${APACHE_LOG_DIR}/ovpn-error.log
+    CustomLog \${APACHE_LOG_DIR}/ovpn-access.log combined
+</VirtualHost>
+EOF
+		# Enable Site
+		if [[ ! -L /etc/apache2/sites-enabled/ovpn-port81.conf ]]; then
+			ln -s /etc/apache2/sites-available/ovpn-port81.conf /etc/apache2/sites-enabled/
+		fi
+		systemctl restart apache2
+
+	else
+		# CentOS / Fedora / RHEL
+		if ! hash httpd 2>/dev/null; then
+			echo "Installing Apache (httpd)..."
+			dnf install -y httpd
+		fi
+
+		# Add Listen 81
+		if ! grep -q "Listen 81" /etc/httpd/conf/httpd.conf; then
+			echo "Listen 81" >> /etc/httpd/conf/httpd.conf
+		fi
+
+		# Create VHost
+		cat <<EOF > /etc/httpd/conf.d/ovpn-port81.conf
+<VirtualHost *:81>
+    DocumentRoot /var/www/ovpn-config
+    <Directory /var/www/ovpn-config>
+        Options +Indexes
+        Require all granted
+    </Directory>
+</VirtualHost>
+EOF
+		systemctl enable --now httpd
+		systemctl restart httpd
+	fi
 }
 
 # Detect Debian users running the script with "sh" instead of bash
@@ -406,7 +538,6 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 	echo
 	echo "Enter a name for the first client:"
 	read -p "Name [client]: " unsanitized_client
-	# Allow a limited set of characters to avoid conflicts
 	client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
 	[[ -z "$client" ]] && client="client"
 	echo
@@ -654,8 +785,10 @@ else
 	# START OF MENU LOOP
 	while true; do
 		header
-		echo "OpenVPN is already installed."
-		echo
+		
+		# SHOW DASHBOARD
+		show_dashboard
+
 		# Check if Squid is installed
 		squid_installed=false
 		if hash squid 2>/dev/null; then
@@ -672,7 +805,7 @@ else
 			echo -e "   3) ${CYAN}Install Squid Proxy${NC}"
 		fi
 
-		echo -e "   4) ${RED}Remove OpenVPN${NC}"
+		echo -e "   4) ${RED}Remove OpenVPN & Web Host${NC}"
 		echo -e "   5) ${CYAN}Exit${NC}"
 		
 		read -p "Option: " option
@@ -696,6 +829,9 @@ else
 				
 				# 1. Build the STANDARD .ovpn file (No Proxy)
 				grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
+				
+				# File to be hosted (Defaults to standard ovpn)
+				file_to_host="$client.ovpn"
 
 				# --- PROXY SUPPORT LOGIC (AUTO-GENERATE SECOND FILE) ---
 				if hash squid 2>/dev/null; then
@@ -733,9 +869,9 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 						
 						echo -e "${GREEN}Generated: $client-Proxy.ovpn${NC}"
 						
-						# --- ZIP AND UPLOAD LOGIC ---
+						# --- ZIP LOGIC ---
 						echo
-						echo -e "${CYAN}Zipping and Uploading...${NC}"
+						echo -e "${CYAN}Zipping...${NC}"
 						
 						# Check for zip
 						if ! hash zip 2>/dev/null; then
@@ -752,30 +888,38 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 						zip_name="${client}.zip"
 						zip -q "$zip_name" "$client".ovpn "$client"-Proxy.ovpn
 						
-						# Check for curl
-						if ! hash curl 2>/dev/null; then
-							echo "Installing curl..."
-							if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
-								apt-get install -y curl
-							else
-								dnf install -y curl
-							fi
-						fi
-						
-						# Upload to 0x0.st
-						echo "Uploading to 0x0.st..."
-						upload_url=$(curl -s -F "file=@$zip_name" -H "User-Agent: MyUploader/1.0 (+mailto:you@example.com)" https://0x0.st)
-						
-						echo
-						echo -e "${GREEN}Upload Complete!${NC}"
-						echo -e "Download URL: ${YELLOW}$upload_url${NC}"
-						echo
+						# Update host file to the zip
+						file_to_host="$zip_name"
 					fi
 				fi
 				# ---------------------------
 
+				# --- APACHE HOSTING LOGIC ---
+				setup_web_hosting
+				
+				# GENERATE RANDOM PATH (SECURITY OBFUSCATION)
+				# Generate a random 32 char alphanumeric string
+				random_path=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 32)
+				
+				# Create the random directory inside the webroot
+				mkdir -p "/var/www/ovpn-config/$random_path"
+				
+				# Copy the file to this random location
+				cd "$script_dir"
+				cp "$file_to_host" "/var/www/ovpn-config/$random_path/$file_to_host"
+				
+				# Get Public IP again to display link
+				if [[ -f /etc/openvpn/server/client-common.txt ]]; then
+					host_ip=$(grep "remote " /etc/openvpn/server/client-common.txt | awk '{print $2}')
+				else
+					host_ip=$(wget -4qO- "http://ip1.dynupdate.no-ip.com/")
+				fi
+
 				echo
 				echo -e "${GREEN}$client added.${NC}"
+				echo -e "Download URL: ${YELLOW}http://$host_ip:81/$random_path/$file_to_host${NC}"
+				echo -e "${CYAN}(This URL is obfuscated and unique to this client)${NC}"
+				
 				read -n1 -r -p "Press any key to return to menu..."
 				;;
 			2)
@@ -870,13 +1014,26 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 					if [[ "$os" = "debian" || "$os" = "ubuntu" ]]; then
 						rm -rf /etc/openvpn/server
 						apt-get remove --purge -y openvpn
+						
+						# CLEAN APACHE
+						rm -f /etc/apache2/sites-enabled/ovpn-port81.conf
+						rm -f /etc/apache2/sites-available/ovpn-port81.conf
+						systemctl restart apache2
 					else
 						# Else, OS must be CentOS or Fedora
 						dnf remove -y openvpn
 						rm -rf /etc/openvpn/server
+						
+						# CLEAN APACHE
+						rm -f /etc/httpd/conf.d/ovpn-port81.conf
+						systemctl restart httpd
 					fi
+					
+					# Clean Web Directory
+					rm -rf /var/www/ovpn-config
+
 					echo
-					echo -e "${GREEN}OpenVPN removed!${NC}"
+					echo -e "${GREEN}OpenVPN & Web Hosting Config removed!${NC}"
 					# Optional: Remove the ovpn command itself
 					rm -f /usr/local/bin/ovpn
 					echo "Manager command 'ovpn' removed."
@@ -892,5 +1049,3 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 		esac
 	done
 fi
-
-}
