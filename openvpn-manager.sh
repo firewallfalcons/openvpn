@@ -15,12 +15,13 @@ NC='\033[0m' # No Color
 # Directory to store .ovpn files locally (prevents cluttering $HOME)
 SCRIPT_DIR="$HOME/ovpn-clients"
 CLIENT_DB="/etc/openvpn/server/client_attributes.txt"
+CONF="/etc/openvpn/server/server.conf"
 
 # --- Helper Functions ---
 function header() {
 	clear
 	echo -e "${GREEN}=================================================${NC}"
-	echo -e "${CYAN}  OPENVPN MANAGER v4.1 (CPU Optimized)           ${NC}"
+	echo -e "${CYAN}  OPENVPN MANAGER v4.3 (Speed Freak Edition)     ${NC}"
 	echo -e "${GREEN}=================================================${NC}"
 	echo ""
 }
@@ -31,11 +32,18 @@ function show_dashboard() {
 	# 1. OpenVPN Status
 	if systemctl is-active --quiet openvpn-server@server.service; then
 		ovpn_status="${GREEN}ACTIVE${NC}"
-		ovpn_port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
-		ovpn_proto=$(grep '^proto ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+		ovpn_port=$(grep '^port ' "$CONF" | cut -d " " -f 2)
+		ovpn_proto=$(grep '^proto ' "$CONF" | cut -d " " -f 2)
+		
+		# Check Optimization Status
+		if grep -q "sndbuf 0" "$CONF"; then
+			opt_status="${GREEN}High Speed (Kernel Buffers)${NC}"
+		else
+			opt_status="${YELLOW}Standard${NC}"
+		fi
 		
 		# Check duplicate-cn status
-		if grep -q "^duplicate-cn" /etc/openvpn/server/server.conf; then
+		if grep -q "^duplicate-cn" "$CONF"; then
 			login_mode="${GREEN}Multi-Device${NC}"
 		else
 			login_mode="${YELLOW}Single-Device${NC}"
@@ -45,8 +53,10 @@ function show_dashboard() {
 		ovpn_port="N/A"
 		ovpn_proto=""
 		login_mode="N/A"
+		opt_status="N/A"
 	fi
 	echo -e "OpenVPN:  $ovpn_status  [Port: $ovpn_port/$ovpn_proto] [Mode: $login_mode]"
+	echo -e "Speed:    $opt_status"
 
 	# 2. Squid Status
 	if hash squid 2>/dev/null && systemctl is-active --quiet squid; then
@@ -100,6 +110,11 @@ function list_clients() {
 			expiry_raw=$(echo "$line" | awk '{print $2}')
 			client_name=$(echo "$line" | sed 's/.*CN=//')
 			
+			# FILTER: Skip the server certificate itself
+			if [[ "$client_name" == "server" ]]; then
+				continue
+			fi
+			
 			# Parse Expiry (YYMMDDHHMMSSZ)
 			exp_year="20${expiry_raw:0:2}"
 			exp_month="${expiry_raw:2:2}"
@@ -152,57 +167,92 @@ function list_clients() {
 	read -n1 -r -p "Press any key to return to menu..."
 }
 
-function optimize_cpu() {
+function manage_optimizations() {
+	header
+	echo -e "${CYAN}Manage Server Optimizations${NC}"
+	echo "Currently checking: $CONF"
 	echo
-	echo -e "${CYAN}Applying High-Performance / Low-CPU settings...${NC}"
+	echo "1) Apply High-Speed Settings (Fix Slow TCP)"
+	echo "2) Remove Optimizations (Revert to Default)"
+	echo "3) Cancel"
+	echo
+	read -p "Select option: " opt_choice
 	
-	CONF="/etc/openvpn/server/server.conf"
-	cp "$CONF" "${CONF}.bak_cpu"
-	
-	# 1. Add fast-io (Linux specific optimization)
-	if ! grep -q "fast-io" "$CONF"; then
-		echo "fast-io" >> "$CONF"
-		echo "Added: fast-io"
-	fi
+	case "$opt_choice" in
+		1)
+			echo
+			echo -e "${GREEN}Applying High-Speed configuration...${NC}"
+			cp "$CONF" "${CONF}.bak_opt"
+			
+			# Clean old optimizations first to prevent duplicates
+			sed -i '/fast-io/d' "$CONF"
+			sed -i '/sndbuf/d' "$CONF"
+			sed -i '/rcvbuf/d' "$CONF"
+			sed -i '/data-ciphers/d' "$CONF"
+			sed -i '/tcp-nodelay/d' "$CONF"
 
-	# 2. Optimize Buffers (Reduces CPU interrupts)
-	if ! grep -q "sndbuf" "$CONF"; then
-		echo "sndbuf 524288" >> "$CONF"
-		echo "rcvbuf 524288" >> "$CONF"
-		echo 'push "sndbuf 524288"' >> "$CONF"
-		echo 'push "rcvbuf 524288"' >> "$CONF"
-		echo "Added: High Performance Buffers (512KB)"
-	fi
+			# 1. fast-io (Linux I/O boost)
+			echo "fast-io" >> "$CONF"
 
-	# 3. Enable Modern Ciphers (Hardware Acceleration)
-	# We append data-ciphers to allow negotiation of AES-GCM which is faster than CBC
-	if ! grep -q "data-ciphers" "$CONF"; then
-		 echo "data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305" >> "$CONF"
-		 echo "data-ciphers-fallback AES-256-CBC" >> "$CONF"
-		 echo "Added: Hardware Accelerated GCM Ciphers"
-	fi
-	
-	systemctl restart openvpn-server@server.service
-	echo -e "${GREEN}Optimizations applied! Service restarted.${NC}"
-	echo -e "${YELLOW}Note: Encryption keys (SHA) were NOT changed to avoid breaking existing clients.${NC}"
-	read -n1 -r -p "Press any key to return to menu..."
+			# 2. Kernel Buffers (sndbuf 0 / rcvbuf 0)
+			# Setting to 0 allows the OS to autotune the window size, often resulting
+			# in much higher speeds than fixed 512kb buffers.
+			echo "sndbuf 0" >> "$CONF"
+			echo "rcvbuf 0" >> "$CONF"
+			echo 'push "sndbuf 0"' >> "$CONF"
+			echo 'push "rcvbuf 0"' >> "$CONF"
+
+			# 3. TCP Specific (Reduces Latency/Lag)
+			ovpn_proto=$(grep '^proto ' "$CONF" | cut -d " " -f 2)
+			if [[ "$ovpn_proto" == "tcp" ]]; then
+				echo "tcp-nodelay" >> "$CONF"
+				echo "Added: tcp-nodelay (Crucial for TCP speed)"
+			fi
+
+			# 4. Modern Ciphers (AES-GCM is faster than CBC)
+			echo "data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305" >> "$CONF"
+			echo "data-ciphers-fallback AES-256-CBC" >> "$CONF"
+			
+			systemctl restart openvpn-server@server.service
+			echo -e "${GREEN}Optimizations Applied! Server restarted.${NC}"
+			read -n1 -r -p "Press any key to continue..."
+			;;
+		2)
+			echo
+			echo -e "${YELLOW}Removing optimizations...${NC}"
+			
+			# Remove specific lines
+			sed -i '/fast-io/d' "$CONF"
+			sed -i '/sndbuf/d' "$CONF"
+			sed -i '/rcvbuf/d' "$CONF"
+			sed -i '/data-ciphers/d' "$CONF"
+			sed -i '/tcp-nodelay/d' "$CONF"
+			
+			systemctl restart openvpn-server@server.service
+			echo -e "${GREEN}Optimizations Removed. Server restarted.${NC}"
+			read -n1 -r -p "Press any key to continue..."
+			;;
+		*)
+			return
+			;;
+	esac
 }
 
 function toggle_duplicate_cn() {
 	echo
 	echo -e "${CYAN}Toggling Multi-Login Settings...${NC}"
 	
-	if grep -q "^duplicate-cn" /etc/openvpn/server/server.conf; then
+	if grep -q "^duplicate-cn" "$CONF"; then
 		# Currently Enabled -> Disable it
-		sed -i 's/^duplicate-cn/;duplicate-cn/' /etc/openvpn/server/server.conf
+		sed -i 's/^duplicate-cn/;duplicate-cn/' "$CONF"
 		echo -e "Status changed to: ${YELLOW}Single-Device Only${NC}"
 		echo "Users can now only connect from one device at a time."
 	else
 		# Currently Disabled -> Enable it
-		if grep -q "^;duplicate-cn" /etc/openvpn/server/server.conf; then
-			sed -i 's/^;duplicate-cn/duplicate-cn/' /etc/openvpn/server/server.conf
+		if grep -q "^;duplicate-cn" "$CONF"; then
+			sed -i 's/^;duplicate-cn/duplicate-cn/' "$CONF"
 		else
-			echo "duplicate-cn" >> /etc/openvpn/server/server.conf
+			echo "duplicate-cn" >> "$CONF"
 		fi
 		echo -e "Status changed to: ${GREEN}Multi-Device Allowed${NC}"
 		echo "Users can now connect multiple devices simultaneously."
@@ -421,8 +471,8 @@ function install_squid() {
 	echo -e "${CYAN}Installing Smart Squid Proxy (Force-to-VPN)...${NC}"
 	
 	# 1. Get OpenVPN Info
-	ovpn_port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
-	ovpn_proto=$(grep '^proto ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+	ovpn_port=$(grep '^port ' "$CONF" | cut -d " " -f 2)
+	ovpn_proto=$(grep '^proto ' "$CONF" | cut -d " " -f 2)
 
 	# WARNING FOR UDP
 	if [[ "$ovpn_proto" == "udp" ]]; then
@@ -501,11 +551,11 @@ EOF
 
 	# 5. FIX OPENVPN BINDING (CRITICAL FOR REDIRECT TO LOCALHOST)
 	# If 'local IP' is set, OpenVPN ignores traffic redirected to 127.0.0.1
-	if grep -q "^local " /etc/openvpn/server/server.conf; then
+	if grep -q "^local " "$CONF"; then
 		echo
 		echo -e "${YELLOW}Configuring OpenVPN to listen on all interfaces (required for localhost redirect)...${NC}"
 		# Comment out the local line
-		sed -i 's/^local /;local /' /etc/openvpn/server/server.conf
+		sed -i 's/^local /;local /' "$CONF"
 		# Restart OpenVPN to apply
 		systemctl restart openvpn-server@server.service
 		echo -e "${GREEN}OpenVPN restarted.${NC}"
@@ -573,7 +623,7 @@ function remove_squid() {
 	fi
 
 	# Remove Firewall Rules
-	ovpn_port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+	ovpn_port=$(grep '^port ' "$CONF" | cut -d " " -f 2)
 
 	if systemctl is-active --quiet firewalld.service; then
 		firewall-cmd --permanent --direct --remove-rule ipv4 nat OUTPUT 0 -p tcp -m owner --uid-owner "$squid_user" -j REDIRECT --to-ports "$ovpn_port"
@@ -587,7 +637,7 @@ function remove_squid() {
 	read -n1 -r -p "Press any key to continue..."
 }
 
-if [[ ! -e /etc/openvpn/server/server.conf ]]; then
+if [[ ! -e "$CONF" ]]; then
 	# ... existing code for installation ...
 	header
 	# Detect some Debian minimal setups where neither wget nor curl are installed
@@ -798,23 +848,28 @@ auth SHA256
 cipher AES-256-GCM
 data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
 fast-io
-sndbuf 524288
-rcvbuf 524288
-push \"sndbuf 524288\"
-push \"rcvbuf 524288\"
+sndbuf 0
+rcvbuf 0
+push \"sndbuf 0\"
+push \"rcvbuf 0\"
 tls-crypt tc.key
 topology subnet
 server 10.8.0.0 255.255.255.0
-duplicate-cn" > /etc/openvpn/server/server.conf
+duplicate-cn" > "$CONF"
+
+	# Add tcp-nodelay if protocol is TCP (during install)
+	if [[ "$protocol" == "tcp" ]]; then
+		echo "tcp-nodelay" >> "$CONF"
+	fi
     
 	# IPv6
 	if [[ -z "$ip6" ]]; then
-		echo 'push "redirect-gateway def1 bypass-dhcp"' >> /etc/openvpn/server/server.conf
+		echo 'push "redirect-gateway def1 bypass-dhcp"' >> "$CONF"
 	else
-		echo 'server-ipv6 fddd:1194:1194:1194::/64' >> /etc/openvpn/server/server.conf
-		echo 'push "redirect-gateway def1 ipv6 bypass-dhcp"' >> /etc/openvpn/server/server.conf
+		echo 'server-ipv6 fddd:1194:1194:1194::/64' >> "$CONF"
+		echo 'push "redirect-gateway def1 ipv6 bypass-dhcp"' >> "$CONF"
 	fi
-	echo 'ifconfig-pool-persist ipp.txt' >> /etc/openvpn/server/server.conf
+	echo 'ifconfig-pool-persist ipp.txt' >> "$CONF"
 	# DNS
 	case "$dns" in
 		1|"")
@@ -827,49 +882,49 @@ duplicate-cn" > /etc/openvpn/server/server.conf
 			fi
 			# Obtain the resolvers from resolv.conf and use them for OpenVPN
 			grep -v '^#\|^;' "$resolv_conf" | grep '^nameserver' | grep -v '127.0.0.53' | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | while read line; do
-				echo "push \"dhcp-option DNS $line\"" >> /etc/openvpn/server/server.conf
+				echo "push \"dhcp-option DNS $line\"" >> "$CONF"
 			done
 		;;
 		2)
-			echo 'push "dhcp-option DNS 8.8.8.8"' >> /etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 8.8.4.4"' >> /etc/openvpn/server/server.conf
+			echo 'push "dhcp-option DNS 8.8.8.8"' >> "$CONF"
+			echo 'push "dhcp-option DNS 8.8.4.4"' >> "$CONF"
 		;;
 		3)
-			echo 'push "dhcp-option DNS 1.1.1.1"' >> /etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 1.0.0.1"' >> /etc/openvpn/server/server.conf
+			echo 'push "dhcp-option DNS 1.1.1.1"' >> "$CONF"
+			echo 'push "dhcp-option DNS 1.0.0.1"' >> "$CONF"
 		;;
 		4)
-			echo 'push "dhcp-option DNS 208.67.222.222"' >> /etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 208.67.220.220"' >> /etc/openvpn/server/server.conf
+			echo 'push "dhcp-option DNS 208.67.222.222"' >> "$CONF"
+			echo 'push "dhcp-option DNS 208.67.220.220"' >> "$CONF"
 		;;
 		5)
-			echo 'push "dhcp-option DNS 9.9.9.9"' >> /etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 149.112.112.112"' >> /etc/openvpn/server/server.conf
+			echo 'push "dhcp-option DNS 9.9.9.9"' >> "$CONF"
+			echo 'push "dhcp-option DNS 149.112.112.112"' >> "$CONF"
 		;;
 		6)
-			echo 'push "dhcp-option DNS 95.85.95.85"' >> /etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 2.56.220.2"' >> /etc/openvpn/server/server.conf
+			echo 'push "dhcp-option DNS 95.85.95.85"' >> "$CONF"
+			echo 'push "dhcp-option DNS 2.56.220.2"' >> "$CONF"
 		;;
 		7)
-			echo 'push "dhcp-option DNS 94.140.14.14"' >> /etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 94.140.15.15"' >> /etc/openvpn/server/server.conf
+			echo 'push "dhcp-option DNS 94.140.14.14"' >> "$CONF"
+			echo 'push "dhcp-option DNS 94.140.15.15"' >> "$CONF"
 		;;
 		8)
 		for dns_ip in $custom_dns; do
-			echo "push \"dhcp-option DNS $dns_ip\"" >> /etc/openvpn/server/server.conf
+			echo "push \"dhcp-option DNS $dns_ip\"" >> "$CONF"
 		done
 		;;
 	esac
-	echo 'push "block-outside-dns"' >> /etc/openvpn/server/server.conf
+	echo 'push "block-outside-dns"' >> "$CONF"
 	echo "keepalive 10 120
 user nobody
 group $group_name
 persist-key
 persist-tun
 verb 3
-crl-verify crl.pem" >> /etc/openvpn/server/server.conf
+crl-verify crl.pem" >> "$CONF"
 	if [[ "$protocol" = "udp" ]]; then
-		echo "explicit-exit-notify" >> /etc/openvpn/server/server.conf
+		echo "explicit-exit-notify" >> "$CONF"
 	fi
 	# Enable net.ipv4.ip_forward for the system
 	echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-openvpn-forward.conf
@@ -1005,7 +1060,7 @@ else
 		echo -e "   5) ${RED}Remove OpenVPN & Web Host${NC}"
 		echo -e "   6) ${BLUE}Exit${NC}"
 		echo -e "   7) ${CYAN}List Clients & Status${NC}"
-		echo -e "   8) ${GREEN}Optimize Server (CPU Fix)${NC}"
+		echo -e "   8) ${GREEN}Manage Server Optimizations${NC}"
 		
 		read -p "Option: " option
 		until [[ "$option" =~ ^[1-8]$ ]]; do
@@ -1192,8 +1247,8 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 					read -p "Confirm OpenVPN removal? [y/N]: " remove
 				done
 				if [[ "$remove" =~ ^[yY]$ ]]; then
-					port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
-					protocol=$(grep '^proto ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+					port=$(grep '^port ' "$CONF" | cut -d " " -f 2)
+					protocol=$(grep '^proto ' "$CONF" | cut -d " " -f 2)
 					if systemctl is-active --quiet firewalld.service; then
 						ip=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep '\-s 10.8.0.0/24 '"'"'!'"'"' -d 10.8.0.0/24' | grep -oE '[^ ]+$')
 						# Using both permanent and not permanent rules to avoid a firewalld reload.
@@ -1203,7 +1258,7 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 						firewall-cmd --permanent --zone=trusted --remove-source=10.8.0.0/24
 						firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
 						firewall-cmd --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
-						if grep -qs "server-ipv6" /etc/openvpn/server/server.conf; then
+						if grep -qs "server-ipv6" "$CONF"; then
 							ip6=$(firewall-cmd --direct --get-rules ipv6 nat POSTROUTING | grep '\-s fddd:1194:1194:1194::/64 '"'"'!'"'"' -d fddd:1194:1194:1194::/64' | grep -oE '[^ ]+$')
 							firewall-cmd --zone=trusted --remove-source=fddd:1194:1194:1194::/64
 							firewall-cmd --permanent --zone=trusted --remove-source=fddd:1194:1194:1194::/64
@@ -1264,7 +1319,7 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 				list_clients
 				;;
 			8)
-				optimize_cpu
+				manage_optimizations
 				;;
 		esac
 	done
