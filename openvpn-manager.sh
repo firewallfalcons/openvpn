@@ -8,13 +8,19 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 PURPLE='\033[0;35m'
+BLUE='\033[0;34m'
 NC='\033[0m' # No Color
+
+# --- Configuration & Paths ---
+# Directory to store .ovpn files locally (prevents cluttering $HOME)
+SCRIPT_DIR="$HOME/ovpn-clients"
+CLIENT_DB="/etc/openvpn/server/client_attributes.txt"
 
 # --- Helper Functions ---
 function header() {
 	clear
 	echo -e "${GREEN}=================================================${NC}"
-	echo -e "${CYAN}  OPENVPN MANAGER v3.7 (Service Repair & Purge)  ${NC}"
+	echo -e "${CYAN}  OPENVPN MANAGER v4.1 (CPU Optimized)           ${NC}"
 	echo -e "${GREEN}=================================================${NC}"
 	echo ""
 }
@@ -76,6 +82,110 @@ function show_dashboard() {
 	echo -e "Hosting:  $web_status  [Port: $web_port]"
 	echo -e "${PURPLE}----------------------${NC}"
 	echo ""
+}
+
+function list_clients() {
+	echo -e "${CYAN}--- Client List & Expiration ---${NC}"
+	echo
+	# Header
+	printf "%-20s %-15s %-15s %-40s\n" "Client Name" "Days Left" "Expiry Date" "Download Link"
+	echo "--------------------------------------------------------------------------------------------"
+
+	# Iterate through easy-rsa index
+	while read -r line; do
+		# Filter for valid certificates (V)
+		if [[ "$line" =~ ^V ]]; then
+			# Extract fields
+			# Index.txt format: V <expiry> <revocation> <serial> <file> <subject>
+			expiry_raw=$(echo "$line" | awk '{print $2}')
+			client_name=$(echo "$line" | sed 's/.*CN=//')
+			
+			# Parse Expiry (YYMMDDHHMMSSZ)
+			exp_year="20${expiry_raw:0:2}"
+			exp_month="${expiry_raw:2:2}"
+			exp_day="${expiry_raw:4:2}"
+			expiry_formatted="$exp_year-$exp_month-$exp_day"
+			
+			# Calculate Days Remaining
+			current_sec=$(date +%s)
+			expiry_sec=$(date -d "$expiry_formatted" +%s 2>/dev/null)
+			
+			# Fallback for systems with older date/awk
+			if [[ -z "$expiry_sec" ]]; then
+				days_left="?"
+			else
+				diff_sec=$((expiry_sec - current_sec))
+				days_left=$((diff_sec / 86400))
+			fi
+
+			# Colorize Days Left
+			if [[ "$days_left" -lt 0 ]]; then
+				days_display="${RED}EXPIRED${NC}"
+			elif [[ "$days_left" -lt 7 ]]; then
+				days_display="${RED}${days_left} days${NC}"
+			elif [[ "$days_left" -lt 30 ]]; then
+				days_display="${YELLOW}${days_left} days${NC}"
+			else
+				days_display="${GREEN}${days_left} days${NC}"
+			fi
+
+			# Get Web Link from DB
+			web_link="N/A"
+			if [[ -f "$CLIENT_DB" ]]; then
+				# Format of DB: name|expiry|random_path
+				db_line=$(grep "^$client_name|" "$CLIENT_DB")
+				if [[ -n "$db_line" ]]; then
+					random_path=$(echo "$db_line" | cut -d '|' -f 3)
+					# Get Host IP
+					if [[ -f /etc/openvpn/server/client-common.txt ]]; then
+						host_ip=$(grep "remote " /etc/openvpn/server/client-common.txt | awk '{print $2}')
+						web_link="http://${host_ip}:81/${random_path}/"
+					fi
+				fi
+			fi
+
+			printf "%-20s %-25b %-15s %-40s\n" "$client_name" "$days_display" "$expiry_formatted" "$web_link"
+		fi
+	done < /etc/openvpn/server/easy-rsa/pki/index.txt
+	
+	echo
+	read -n1 -r -p "Press any key to return to menu..."
+}
+
+function optimize_cpu() {
+	echo
+	echo -e "${CYAN}Applying High-Performance / Low-CPU settings...${NC}"
+	
+	CONF="/etc/openvpn/server/server.conf"
+	cp "$CONF" "${CONF}.bak_cpu"
+	
+	# 1. Add fast-io (Linux specific optimization)
+	if ! grep -q "fast-io" "$CONF"; then
+		echo "fast-io" >> "$CONF"
+		echo "Added: fast-io"
+	fi
+
+	# 2. Optimize Buffers (Reduces CPU interrupts)
+	if ! grep -q "sndbuf" "$CONF"; then
+		echo "sndbuf 524288" >> "$CONF"
+		echo "rcvbuf 524288" >> "$CONF"
+		echo 'push "sndbuf 524288"' >> "$CONF"
+		echo 'push "rcvbuf 524288"' >> "$CONF"
+		echo "Added: High Performance Buffers (512KB)"
+	fi
+
+	# 3. Enable Modern Ciphers (Hardware Acceleration)
+	# We append data-ciphers to allow negotiation of AES-GCM which is faster than CBC
+	if ! grep -q "data-ciphers" "$CONF"; then
+		 echo "data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305" >> "$CONF"
+		 echo "data-ciphers-fallback AES-256-CBC" >> "$CONF"
+		 echo "Added: Hardware Accelerated GCM Ciphers"
+	fi
+	
+	systemctl restart openvpn-server@server.service
+	echo -e "${GREEN}Optimizations applied! Service restarted.${NC}"
+	echo -e "${YELLOW}Note: Encryption keys (SHA) were NOT changed to avoid breaking existing clients.${NC}"
+	read -n1 -r -p "Press any key to return to menu..."
 }
 
 function toggle_duplicate_cn() {
@@ -302,8 +412,8 @@ if [[ ! -e /dev/net/tun ]] || ! ( exec 7<>/dev/net/tun ) 2>/dev/null; then
 	exit
 fi
 
-# Store the directory where the .ovpn files will be saved (User's Home)
-script_dir="$HOME"
+# Store the directory where the .ovpn files will be saved (DIRECTORY FIX)
+mkdir -p "$SCRIPT_DIR"
 
 # --- Squid Logic ---
 function install_squid() {
@@ -447,6 +557,33 @@ WantedBy=multi-user.target" > /etc/systemd/system/squid-redirect.service
 	echo -e "${GREEN}Smart Squid Proxy Installed on ports: $squid_ports_input${NC}"
 	echo -e "${YELLOW}Traffic from Squid is now redirected to OpenVPN (Port $ovpn_port).${NC}"
 	echo -e "OpenVPN has been configured to listen on ALL interfaces to accept this traffic."
+	read -n1 -r -p "Press any key to continue..."
+}
+
+function remove_squid() {
+	header
+	echo -e "${RED}Removing Squid Proxy...${NC}"
+
+	if [[ "$os" == "debian" || "$os" == "ubuntu" ]]; then
+		squid_user="proxy"
+		apt-get remove --purge -y squid
+	else
+		squid_user="squid"
+		dnf remove -y squid
+	fi
+
+	# Remove Firewall Rules
+	ovpn_port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+
+	if systemctl is-active --quiet firewalld.service; then
+		firewall-cmd --permanent --direct --remove-rule ipv4 nat OUTPUT 0 -p tcp -m owner --uid-owner "$squid_user" -j REDIRECT --to-ports "$ovpn_port"
+		firewall-cmd --reload
+	else
+		systemctl disable --now squid-redirect.service
+		rm -f /etc/systemd/system/squid-redirect.service
+	fi
+	
+	echo -e "${GREEN}Squid removed.${NC}"
 	read -n1 -r -p "Press any key to continue..."
 }
 
@@ -657,7 +794,14 @@ ca ca.crt
 cert server.crt
 key server.key
 dh dh.pem
-auth SHA512
+auth SHA256
+cipher AES-256-GCM
+data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
+fast-io
+sndbuf 524288
+rcvbuf 524288
+push \"sndbuf 524288\"
+push \"rcvbuf 524288\"
 tls-crypt tc.key
 topology subnet
 server 10.8.0.0 255.255.255.0
@@ -811,13 +955,13 @@ nobind
 persist-key
 persist-tun
 remote-cert-tls server
-auth SHA512
+auth SHA256
 ignore-unknown-option block-outside-dns
 verb 3" > /etc/openvpn/server/client-common.txt
 	# Enable and start the OpenVPN service
 	systemctl enable --now openvpn-server@server.service
 	# Build the $client.ovpn file, stripping comments from easy-rsa in the process
-	grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
+	grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$SCRIPT_DIR"/"$client".ovpn
 	
 	# --- FORCE PORT 81 SETUP (FIX FOR DASHBOARD) ---
 	setup_web_hosting
@@ -825,7 +969,7 @@ verb 3" > /etc/openvpn/server/client-common.txt
 	echo
 	echo -e "${GREEN}Finished!${NC}"
 	echo
-	echo -e "The client configuration is available in: ${CYAN}$script_dir/$client.ovpn${NC}"
+	echo -e "The client configuration is available in: ${CYAN}$SCRIPT_DIR/$client.ovpn${NC}"
 	echo "You can manage users by typing 'ovpn' command."
 else
 	# START OF MENU LOOP
@@ -859,10 +1003,12 @@ else
 		fi
 
 		echo -e "   5) ${RED}Remove OpenVPN & Web Host${NC}"
-		echo -e "   6) ${CYAN}Exit${NC}"
+		echo -e "   6) ${BLUE}Exit${NC}"
+		echo -e "   7) ${CYAN}List Clients & Status${NC}"
+		echo -e "   8) ${GREEN}Optimize Server (CPU Fix)${NC}"
 		
 		read -p "Option: " option
-		until [[ "$option" =~ ^[1-6]$ ]]; do
+		until [[ "$option" =~ ^[1-8]$ ]]; do
 			echo "$option: invalid selection."
 			read -p "Option: " option
 		done
@@ -877,11 +1023,19 @@ else
 					read -p "Name: " unsanitized_client
 					client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
 				done
+				
+				# --- Expiration Logic ---
+				echo
+				echo "Enter Validity Period in Days (e.g. 30, 365, 3650)"
+				read -p "Days [365]: " valid_days
+				[[ -z "$valid_days" ]] && valid_days="365"
+				
 				cd /etc/openvpn/server/easy-rsa/
-				./easyrsa --batch --days=3650 build-client-full "$client" nopass
+				# Use --days to enforce expiration via certificate
+				./easyrsa --batch --days="$valid_days" build-client-full "$client" nopass
 				
 				# 1. Build the STANDARD .ovpn file (No Proxy)
-				grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
+				grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$SCRIPT_DIR"/"$client".ovpn
 				
 				# Default File (Standard)
 				# We don't use $file_to_host variable anymore, we copy both explicitly.
@@ -916,8 +1070,8 @@ http-proxy-option CUSTOM-HEADER Host $proxy_host
 http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 "
 						# Generate the Proxy Config File
-						echo "$proxy_config_string" > "$script_dir"/"$client"-Proxy.ovpn
-						cat "$script_dir"/"$client".ovpn >> "$script_dir"/"$client"-Proxy.ovpn
+						echo "$proxy_config_string" > "$SCRIPT_DIR"/"$client"-Proxy.ovpn
+						cat "$SCRIPT_DIR"/"$client".ovpn >> "$SCRIPT_DIR"/"$client"-Proxy.ovpn
 						
 						echo -e "${GREEN}Generated: $client-Proxy.ovpn${NC}"
 					fi
@@ -934,12 +1088,16 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 				mkdir -p "/var/www/ovpn-config/$random_path"
 				
 				# Copy Standard File
-				cp "$script_dir/$client.ovpn" "/var/www/ovpn-config/$random_path/$client.ovpn"
+				cp "$SCRIPT_DIR/$client.ovpn" "/var/www/ovpn-config/$random_path/$client.ovpn"
 				
 				# Copy Proxy File if exists
-				if [[ -f "$script_dir/$client-Proxy.ovpn" ]]; then
-					cp "$script_dir/$client-Proxy.ovpn" "/var/www/ovpn-config/$random_path/$client-Proxy.ovpn"
+				if [[ -f "$SCRIPT_DIR/$client-Proxy.ovpn" ]]; then
+					cp "$SCRIPT_DIR/$client-Proxy.ovpn" "/var/www/ovpn-config/$random_path/$client-Proxy.ovpn"
 				fi
+				
+				# --- Save to DB for listing later ---
+				# Format: name|expiry_days|random_path
+				echo "$client|$valid_days|$random_path" >> "$CLIENT_DB"
 				
 				# Get Public IP
 				if [[ -f /etc/openvpn/server/client-common.txt ]]; then
@@ -954,12 +1112,13 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 				echo -e "Standard Config:"
 				echo -e "${YELLOW}http://$host_ip:81/$random_path/$client.ovpn${NC}"
 				
-				if [[ -f "$script_dir/$client-Proxy.ovpn" ]]; then
+				if [[ -f "$SCRIPT_DIR/$client-Proxy.ovpn" ]]; then
 					echo -e "------------------------------------------------"
 					echo -e "Proxy Config:"
 					echo -e "${YELLOW}http://$host_ip:81/$random_path/$client-Proxy.ovpn${NC}"
 				fi
 				echo -e "------------------------------------------------"
+				echo "Files are also saved locally in: $SCRIPT_DIR/"
 				
 				read -n1 -r -p "Press any key to return to menu..."
 				;;
@@ -998,6 +1157,12 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 						cp /etc/openvpn/server/easy-rsa/pki/crl.pem /etc/openvpn/server/crl.pem
 						# CRL is read with each client connection, when OpenVPN is dropped to nobody
 						chown nobody:"$group_name" /etc/openvpn/server/crl.pem
+						
+						# Remove from DB
+						if [[ -f "$CLIENT_DB" ]]; then
+							sed -i "/^$client|/d" "$CLIENT_DB"
+						fi
+						
 						echo
 						echo -e "${GREEN}$client revoked!${NC}"
 					else
@@ -1079,6 +1244,7 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 					
 					# Clean Web Directory (Redundant but safe)
 					rm -rf /var/www/ovpn-config
+					rm -rf "$SCRIPT_DIR"
 
 					echo
 					echo -e "${GREEN}OpenVPN & Web Hosting Config removed!${NC}"
@@ -1093,6 +1259,12 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 				;;
 			6)
 				exit 0
+				;;
+			7)
+				list_clients
+				;;
+			8)
+				optimize_cpu
 				;;
 		esac
 	done
