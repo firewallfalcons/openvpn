@@ -1,5 +1,6 @@
 #!/bin/bash
 #
+# OpenVPN Manager - Speed Freak Edition (Updated UI & Router Fixes)
 #
 
 # --- UI Colors ---
@@ -9,6 +10,7 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 PURPLE='\033[0;35m'
 BLUE='\033[0;34m'
+WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
 # --- Configuration & Paths ---
@@ -18,59 +20,75 @@ CLIENT_DB="/etc/openvpn/server/client_attributes.txt"
 CONF="/etc/openvpn/server/server.conf"
 
 # --- Helper Functions ---
+
+function get_system_load() {
+	# CPU Usage
+	cpu_load=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1"%"}')
+	# RAM Usage
+	mem_used=$(free -m | awk '/Mem:/ { print $3 }')
+	mem_total=$(free -m | awk '/Mem:/ { print $2 }')
+	# Disk Usage
+	disk_usage=$(df -h / | awk '/\// {print $5}')
+	
+	echo -e "${WHITE}SYS LOAD:${NC} CPU: ${CYAN}$cpu_load${NC} | RAM: ${CYAN}$mem_used/${mem_total}MB${NC} | DISK: ${CYAN}$disk_usage${NC}"
+}
+
 function header() {
 	clear
-	echo -e "${GREEN}=================================================${NC}"
-	echo -e "${CYAN}  OPENVPN MANAGER v4.3 (Speed Freak Edition)     ${NC}"
-	echo -e "${GREEN}=================================================${NC}"
+	echo -e "${GREEN}================================================================${NC}"
+	echo -e "${WHITE}           OPENVPN MANAGER v5.0 (Router Fix Edition)            ${NC}"
+	echo -e "${GREEN}================================================================${NC}"
+	get_system_load
+	echo -e "${GREEN}================================================================${NC}"
 	echo ""
 }
 
 function show_dashboard() {
-	echo -e "${PURPLE}--- SERVICE STATUS ---${NC}"
+	echo -e "${WHITE} [ SERVICE STATUS ] ${NC}"
 	
 	# 1. OpenVPN Status
 	if systemctl is-active --quiet openvpn-server@server.service; then
-		ovpn_status="${GREEN}ACTIVE${NC}"
+		ovpn_status="${GREEN}● ACTIVE${NC}"
 		ovpn_port=$(grep '^port ' "$CONF" | cut -d " " -f 2)
 		ovpn_proto=$(grep '^proto ' "$CONF" | cut -d " " -f 2)
 		
 		# Check Optimization Status
 		if grep -q "sndbuf 0" "$CONF"; then
-			opt_status="${GREEN}High Speed (Kernel Buffers)${NC}"
+			opt_status="${CYAN}High Speed (Kernel Opts)${NC}"
 		else
 			opt_status="${YELLOW}Standard${NC}"
 		fi
 		
 		# Check duplicate-cn status
 		if grep -q "^duplicate-cn" "$CONF"; then
-			login_mode="${GREEN}Multi-Device${NC}"
+			login_mode="${CYAN}Multi-Device${NC}"
 		else
 			login_mode="${YELLOW}Single-Device${NC}"
 		fi
 	else
-		ovpn_status="${RED}INACTIVE${NC}"
+		ovpn_status="${RED}● DOWN${NC}"
 		ovpn_port="N/A"
 		ovpn_proto=""
 		login_mode="N/A"
 		opt_status="N/A"
 	fi
-	echo -e "OpenVPN:  $ovpn_status  [Port: $ovpn_port/$ovpn_proto] [Mode: $login_mode]"
-	echo -e "Speed:    $opt_status"
+	
+	printf " %-15s : %b  %-15s : %b\n" "VPN Service" "$ovpn_status" "Protocol" "${WHITE}$ovpn_port/$ovpn_proto${NC}"
+	printf " %-15s : %b  %-15s : %b\n" "Login Mode" "$login_mode" "Optimization" "$opt_status"
 
 	# 2. Squid Status
 	if hash squid 2>/dev/null && systemctl is-active --quiet squid; then
-		squid_status="${GREEN}ACTIVE${NC}"
+		squid_status="${GREEN}● ACTIVE${NC}"
 		# Extract ports from squid.conf (simple grep)
 		squid_ports=$(grep "^http_port" /etc/squid/squid.conf | awk '{print $2}' | tr '\n' ' ')
 	elif hash squid 2>/dev/null; then
-		squid_status="${RED}STOPPED${NC}"
+		squid_status="${RED}● STOPPED${NC}"
 		squid_ports="N/A"
 	else
-		squid_status="${YELLOW}NOT INSTALLED${NC}"
+		squid_status="${YELLOW}● NOT INSTALLED${NC}"
 		squid_ports=""
 	fi
-	echo -e "Squid:    $squid_status  [Ports: $squid_ports]"
+	printf " %-15s : %b  %-15s : %b\n" "Squid Proxy" "$squid_status" "Proxy Ports" "${WHITE}$squid_ports${NC}"
 
 	# 3. Web Host Status (Apache Port 81)
 	web_service="apache2"
@@ -79,27 +97,26 @@ function show_dashboard() {
 	if systemctl is-active --quiet $web_service; then
 		# Check if our config exists
 		if [[ -f /etc/apache2/sites-enabled/ovpn-port81.conf || -f /etc/httpd/conf.d/ovpn-port81.conf ]]; then
-			web_status="${GREEN}ACTIVE${NC}"
-			web_port="81 (Exclusive)"
+			web_status="${GREEN}● ACTIVE${NC}"
+			web_info="${WHITE}Port 81 (Config Host)${NC}"
 		else
-			web_status="${YELLOW}RUNNING (Default Config)${NC}"
-			web_port="?"
+			web_status="${YELLOW}● RUNNING${NC}"
+			web_info="Default Config"
 		fi
 	else
-		web_status="${RED}INACTIVE${NC}"
-		web_port="N/A"
+		web_status="${RED}● DOWN${NC}"
+		web_info="N/A"
 	fi
-	echo -e "Hosting:  $web_status  [Port: $web_port]"
-	echo -e "${PURPLE}----------------------${NC}"
-	echo ""
+	printf " %-15s : %b  %-15s : %b\n" "Web Hosting" "$web_status" "Details" "$web_info"
+	echo -e "${GREEN}----------------------------------------------------------------${NC}"
 }
 
 function list_clients() {
 	echo -e "${CYAN}--- Client List & Expiration ---${NC}"
 	echo
 	# Header
-	printf "%-20s %-15s %-15s %-40s\n" "Client Name" "Days Left" "Expiry Date" "Download Link"
-	echo "--------------------------------------------------------------------------------------------"
+	printf "%-18s %-15s %-12s %-40s\n" "Client Name" "Status" "Expiry" "Config Link"
+	echo "----------------------------------------------------------------------------------------"
 
 	# Iterate through easy-rsa index
 	while read -r line; do
@@ -159,7 +176,7 @@ function list_clients() {
 				fi
 			fi
 
-			printf "%-20s %-25b %-15s %-40s\n" "$client_name" "$days_display" "$expiry_formatted" "$web_link"
+			printf "%-18s %-25b %-12s %-40s\n" "$client_name" "$days_display" "$expiry_formatted" "$web_link"
 		fi
 	done < /etc/openvpn/server/easy-rsa/pki/index.txt
 	
@@ -1046,21 +1063,23 @@ else
 			squid_installed=true
 		fi
 		
-		echo "Select an option:"
-		echo -e "   1) ${GREEN}Add a new VPN client${NC}"
-		echo -e "   2) ${YELLOW}Revoke an existing VPN client${NC}"
-		echo -e "   3) ${PURPLE}Toggle Multi-Login (Currently: $login_mode)${NC}"
+		echo -e "${CYAN} --- CLIENT MANAGEMENT --- ${NC}"
+		echo -e "   1) ${GREEN}Create New Client${NC}"
+		echo -e "   2) ${YELLOW}Revoke Client${NC}"
+		echo -e "   3) ${CYAN}List Clients${NC}"
+		echo -e "${CYAN} --- SERVER MANAGEMENT --- ${NC}"
+		echo -e "   4) ${PURPLE}Toggle Multi-Login Mode (Currently: $login_mode)${NC}"
+		echo -e "   5) ${BLUE}Server Optimizations (Speed)${NC}"
 		
 		if [ "$squid_installed" = true ]; then
-			echo -e "   4) ${RED}Remove Squid Proxy${NC}"
+			echo -e "   6) ${RED}Remove Squid Proxy${NC}"
 		else
-			echo -e "   4) ${CYAN}Install Squid Proxy${NC}"
+			echo -e "   6) ${CYAN}Install Squid Proxy${NC}"
 		fi
 
-		echo -e "   5) ${RED}Remove OpenVPN & Web Host${NC}"
-		echo -e "   6) ${BLUE}Exit${NC}"
-		echo -e "   7) ${CYAN}List Clients & Status${NC}"
-		echo -e "   8) ${GREEN}Manage Server Optimizations${NC}"
+		echo -e "${CYAN} --- SYSTEM --- ${NC}"
+		echo -e "   7) ${RED}Uninstall OpenVPN & Web Host${NC}"
+		echo -e "   8) ${WHITE}Exit${NC}"
 		
 		read -p "Option: " option
 		until [[ "$option" =~ ^[1-8]$ ]]; do
@@ -1085,12 +1104,25 @@ else
 				read -p "Days [365]: " valid_days
 				[[ -z "$valid_days" ]] && valid_days="365"
 				
+				# --- NEW ROUTER FIX OPTION ---
+				echo
+				echo -e "${YELLOW}Is this client for a Router/Device that crashes with IPv6 (RTNETLINK error)?${NC}"
+				read -p "Enable Legacy Mode (Disable IPv6)? [y/N]: " legacy_mode
+				
 				cd /etc/openvpn/server/easy-rsa/
 				# Use --days to enforce expiration via certificate
 				./easyrsa --batch --days="$valid_days" build-client-full "$client" nopass
 				
 				# 1. Build the STANDARD .ovpn file (No Proxy)
 				grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$SCRIPT_DIR"/"$client".ovpn
+				
+				# APPLY ROUTER FIX IF REQUESTED
+				if [[ "$legacy_mode" =~ ^[yY]$ ]]; then
+					echo -e "\n# --- Router IPv6 Fix ---" >> "$SCRIPT_DIR"/"$client".ovpn
+					echo 'pull-filter ignore "ifconfig-ipv6"' >> "$SCRIPT_DIR"/"$client".ovpn
+					echo 'pull-filter ignore "route-ipv6"' >> "$SCRIPT_DIR"/"$client".ovpn
+					echo -e "${GREEN}Legacy Mode Enabled: IPv6 instructions removed for this client.${NC}"
+				fi
 				
 				# Default File (Standard)
 				# We don't use $file_to_host variable anymore, we copy both explicitly.
@@ -1105,11 +1137,15 @@ else
 						# Get public IP for proxy
 						proxy_ip=$(grep "remote " /etc/openvpn/server/client-common.txt | awk '{print $2}')
 						
+						# SMART PORT DETECTION
+						squid_port_def=$(grep "^http_port" /etc/squid/squid.conf | awk '{print $2}' | head -n 1)
+						[[ -z "$squid_port_def" ]] && squid_port_def="8080"
+						
 						# Ask for Port
 						echo
 						echo "Enter the Proxy Port you want to use."
-						read -p "Port [8080]: " proxy_port
-						[[ -z "$proxy_port" ]] && proxy_port="8080"
+						read -p "Port [$squid_port_def]: " proxy_port
+						[[ -z "$proxy_port" ]] && proxy_port="$squid_port_def"
 
 						# Ask for Custom Header Host (Bug Host)
 						echo
@@ -1228,9 +1264,15 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 				fi
 				;;
 			3)
-				toggle_duplicate_cn
+				list_clients
 				;;
 			4)
+				toggle_duplicate_cn
+				;;
+			5)
+				manage_optimizations
+				;;
+			6)
 				if [ "$squid_installed" = true ]; then
 					remove_squid
 				else
@@ -1238,7 +1280,7 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 					install_squid
 				fi
 				;;
-			5)
+			7)
 				echo
 				echo -e "${RED}WARNING: This will remove OpenVPN and all configuration files.${NC}"
 				read -p "Confirm OpenVPN removal? [y/N]: " remove
@@ -1312,15 +1354,11 @@ http-proxy-option CUSTOM-HEADER X-Forwarded-For $proxy_host
 					echo "OpenVPN removal aborted!"
 				fi
 				;;
-			6)
-				exit 0
-				;;
-			7)
-				list_clients
-				;;
 			8)
-				manage_optimizations
+				exit 0
 				;;
 		esac
 	done
 fi
+
+}
